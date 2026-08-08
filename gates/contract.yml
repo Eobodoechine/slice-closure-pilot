@@ -1,7 +1,22 @@
 # Slice Closure Gate contract. Read ONLY from the base branch by CI.
 # Rule: a PR that edits gates/** or .github/workflows/** fails the gate.
 slice_id: "SLICE-PILOT-001"
-expect_substring: "def validate_pilot_input"
-# expect_file: ""            # optional: restrict substring search to one file
+
+# expect_definition is AST-checked: the name must be a real def/async def/class
+# binding in the committed tree. Use this for "the slice landed the symbol".
+#
+# It replaces `expect_substring: "def validate_pilot_input"`, which was a raw text
+# match and therefore satisfied by a mention in a comment or docstring. That is not
+# theoretical here: branch pilot/t3-hollow was written to be BLOCKED and passed,
+# because its own docstring said the file "deliberately does NOT contain
+# `def validate_pilot_input`". Note expect_file would NOT have prevented that --
+# it narrows which text is searched, then still does a raw match.
+expect_definition: "validate_pilot_input"
+
+# expect_file: ""            # optional: restrict the search to one path
+# expect_substring: ""       # raw text match -- only for assertions genuinely about
+#                            # text (a version string, a config value), never for
+#                            # "this symbol exists". See reality_gate.py's docstring.
+
 test_cmd: "python3 -m pytest -q"
 test_timeout: 600

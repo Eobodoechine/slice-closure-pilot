@@ -20,21 +20,31 @@ call.
 Convention matched from commit_diff_reread.py: stdlib-only, manual `sys.argv` parsing,
 `json.dumps`/`json.dump` output, documented exit codes, GIT_TIMEOUT=30.
 
+Binding checks -- `--expect-substring` vs `--expect-definition`:
+  --expect-substring is a RAW TEXT match and is satisfied by any occurrence,
+  including one inside a comment, a docstring, or a string literal. It cannot
+  distinguish "the symbol was defined" from "the symbol was mentioned", and
+  --expect-file does not change that (it only narrows which text is searched).
+  Prefer --expect-definition, which parses the committed blob with `ast` and
+  requires a real def/async def/class binding. Keep --expect-substring only for
+  assertions that genuinely are about text (a config value, a version string).
+
 Subcommands:
   check --repo <path> --commit <hash|HEAD>
-        [--expect-substring <str>] [--expect-file <relpath>]
-        [--test-cmd <cmd>] [--test-timeout N]
+        [--expect-substring <str>] [--expect-definition <identifier>]
+        [--expect-file <relpath>] [--test-cmd <cmd>] [--test-timeout N]
       Read-only. Runs ground-truth checks and prints a JSON result. Writes nothing.
       Imposes no binding-check requirement. Exit 0 iff passed, else 1.
 
   verify --status-json <path> --item <id-or-exact-title>
          --repo <path> --commit <hash|HEAD>
-         [--expect-substring <str>] [--expect-file <relpath>]
-         [--test-cmd <cmd>] [--test-timeout N] [--log <path>] [--now <iso8601>]
+         [--expect-substring <str>] [--expect-definition <identifier>]
+         [--expect-file <relpath>] [--test-cmd <cmd>] [--test-timeout N]
+         [--log <path>] [--now <iso8601>]
       Runs the SAME checks as `check`, then -- iff they pass -- atomically marks the
-      located item verified. REQUIRES at least one binding check (--expect-substring
-      and/or --test-cmd). Exit 0 on pass-and-write, 1 on check-fail-and-downgrade,
-      2 on usage/lookup/bad-status errors.
+      located item verified. REQUIRES at least one binding check (--expect-substring,
+      --expect-definition, and/or --test-cmd). Exit 0 on pass-and-write, 1 on
+      check-fail-and-downgrade, 2 on usage/lookup/bad-status errors.
 
   init-status --path <path> --product <name> --done <sentence>
       Writes a status.json skeleton (empty items) iff --path does not exist. Never
@@ -45,8 +55,11 @@ Exit codes:
   1  check failed (check/verify): a requested check did not pass
   2  usage error, item not found/ambiguous, bad status.json, or existing init path.
      Named reason tokens appear in the stdout JSON: "no-binding-check",
-     "test-timeout", "bad-status-json".
+     "test-timeout", "bad-status-json", "substring-absent", "definition-absent",
+     "definition-unsupported-language", "definition-unparseable",
+     "definition-unreadable".
 """
+import ast
 import json
 import os
 import subprocess
@@ -146,6 +159,70 @@ def _substring_present(repo: str, sha: str, substring: str,
     return any(substring in line for line in added)
 
 
+def _changed_paths(repo: str, sha: str) -> Optional[List[str]]:
+    """Paths the commit added or modified (deletions excluded -- a deleted file
+    cannot hold a definition). None on git failure."""
+    r = _git(repo, "show", sha, "--name-only", "--format=", "--diff-filter=d")
+    if r is None or r.returncode != 0:
+        return None
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def _definition_present(repo: str, sha: str, name: str,
+                        expect_file: Optional[str]) -> Tuple[bool, Optional[str]]:
+    """Whether `name` is genuinely DEFINED in the committed tree at `sha`.
+
+    Parses the committed blob with `ast`, so `name` must appear as a real
+    `def` / `async def` / `class` binding. A mention inside a comment, a
+    docstring, or any string literal can never satisfy this.
+
+    That is the entire reason this check exists. `--expect-substring` is
+    satisfied by ANY added patch line containing the string, so a commit whose
+    only mention of the pinned symbol is `# TODO: def foo` passes it -- and
+    `--expect-file` does not help, because it still does a raw `in` against the
+    blob. A hollow slice that defines nothing therefore verified green. The
+    known real-world instance: a proof branch whose sole matching line was its
+    own docstring saying the file "deliberately does NOT contain
+    `def validate_pilot_input`" -- the disclaimer satisfied the gate.
+
+    Scope: `--expect-file` restricts the search to that one path; otherwise every
+    .py path the commit touched is parsed. Python only, deliberately -- anything
+    else returns "definition-unsupported-language" rather than falling back to a
+    fuzzy text match, since fuzziness is the defect being closed here.
+    """
+    if expect_file is not None:
+        candidates: List[str] = [expect_file]
+    else:
+        changed = _changed_paths(repo, sha)
+        if changed is None:
+            return False, "definition-unreadable"
+        candidates = changed
+
+    py_candidates = [p for p in candidates if p.endswith(".py")]
+    if not py_candidates:
+        return False, "definition-unsupported-language"
+
+    parsed_any = False
+    for path in py_candidates:
+        blob = subprocess_git_bytes(repo, "%s:%s" % (sha, path))
+        if blob is None:
+            continue
+        try:
+            tree = ast.parse(blob.decode("utf-8", errors="replace"))
+        except (SyntaxError, ValueError):
+            continue
+        parsed_any = True
+        for node in ast.walk(tree):
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ) and node.name == name:
+                return True, None
+
+    if not parsed_any:
+        return False, "definition-unparseable"
+    return False, "definition-absent"
+
+
 def subprocess_git_bytes(repo: str, spec: str) -> Optional[bytes]:
     """`git -C repo show <spec>` returning raw bytes (for binary-safe blob reads),
     or None on failure."""
@@ -183,11 +260,12 @@ def _test_passes(repo: str, cmd: str, timeout: int) -> Tuple[bool, Optional[str]
 
 def run_checks(repo: str, commit: str, expect_substring: Optional[str],
                expect_file: Optional[str], test_cmd: Optional[str],
-               test_timeout: int) -> Dict:
+               test_timeout: int,
+               expect_definition: Optional[str] = None) -> Dict:
     """Run the ground-truth checks and return the result dict:
       {"passed": bool, "commit": <sha-or-None>,
        "checks": {"commit-is-real": bool, "substring-present": bool/None,
-                  "test-passes": bool/None},
+                  "definition-present": bool/None, "test-passes": bool/None},
        "reasons": [<token>, ...]}
     `passed` is the logical AND over the checks that actually ran."""
     reasons: List[str] = []
@@ -211,6 +289,16 @@ def run_checks(repo: str, commit: str, expect_substring: Optional[str],
         if substring_check is False:
             reasons.append("substring-absent")
 
+    definition_check: Optional[bool] = None
+    if expect_definition is not None:
+        if sha is None:
+            definition_check, def_reason = False, "definition-absent"
+        else:
+            definition_check, def_reason = _definition_present(
+                repo, sha, expect_definition, expect_file)
+        if definition_check is False:
+            reasons.append(def_reason or "definition-absent")
+
     test_check: Optional[bool] = None
     if test_cmd is not None:
         test_check, test_reason = _test_passes(repo, test_cmd, test_timeout)
@@ -219,7 +307,8 @@ def run_checks(repo: str, commit: str, expect_substring: Optional[str],
         elif test_check is False:
             reasons.append("test-failed")
 
-    ran = [v for v in (commit_real, substring_check, test_check) if v is not None]
+    ran = [v for v in (commit_real, substring_check, definition_check, test_check)
+           if v is not None]
     passed = all(ran)
 
     return {
@@ -228,6 +317,7 @@ def run_checks(repo: str, commit: str, expect_substring: Optional[str],
         "checks": {
             "commit-is-real": commit_real,
             "substring-present": substring_check,
+            "definition-present": definition_check,
             "test-passes": test_check,
         },
         "reasons": reasons,
@@ -270,11 +360,17 @@ def cmd_check(rest: List[str]) -> int:
         return _usage_error("check requires --repo and --commit")
 
     expect_substring = opts.get("expect-substring")
+    expect_definition = opts.get("expect-definition")
     expect_file = opts.get("expect-file")
     test_cmd = opts.get("test-cmd")
 
-    if expect_file is not None and expect_substring is None:
-        return _usage_error("--expect-file requires --expect-substring")
+    if expect_file is not None and expect_substring is None \
+            and expect_definition is None:
+        return _usage_error(
+            "--expect-file requires --expect-substring or --expect-definition")
+    if expect_definition is not None and not expect_definition.isidentifier():
+        return _usage_error(
+            "--expect-definition must be a bare identifier (e.g. 'foo', not 'def foo')")
 
     try:
         test_timeout = int(opts.get("test-timeout", DEFAULT_TEST_TIMEOUT))
@@ -282,7 +378,8 @@ def cmd_check(rest: List[str]) -> int:
         return _usage_error("--test-timeout must be an integer")
 
     result = run_checks(opts["repo"], opts["commit"], expect_substring,
-                        expect_file, test_cmd, test_timeout)
+                        expect_file, test_cmd, test_timeout,
+                        expect_definition=expect_definition)
     print(json.dumps(result))
     return 0 if result["passed"] else 1
 
@@ -315,21 +412,27 @@ def cmd_verify(rest: List[str]) -> int:
         return _usage_error("verify requires --status-json, --item, --repo, --commit")
 
     expect_substring = opts.get("expect-substring")
+    expect_definition = opts.get("expect-definition")
     expect_file = opts.get("expect-file")
     test_cmd = opts.get("test-cmd")
     log = opts.get("log")
     now = opts.get("now")
 
-    if expect_file is not None and expect_substring is None:
-        return _usage_error("--expect-file requires --expect-substring")
+    if expect_file is not None and expect_substring is None \
+            and expect_definition is None:
+        return _usage_error(
+            "--expect-file requires --expect-substring or --expect-definition")
+    if expect_definition is not None and not expect_definition.isidentifier():
+        return _usage_error(
+            "--expect-definition must be a bare identifier (e.g. 'foo', not 'def foo')")
 
     # Binding requirement (SECURITY): commit-is-real alone can never verify.
-    if expect_substring is None and test_cmd is None:
+    if expect_substring is None and expect_definition is None and test_cmd is None:
         print(json.dumps({
             "passed": False,
             "error": "no-binding-check",
-            "reason": "no-binding-check: verify requires --expect-substring "
-                      "and/or --test-cmd",
+            "reason": "no-binding-check: verify requires --expect-substring, "
+                      "--expect-definition, and/or --test-cmd",
         }))
         return 2
 
@@ -372,7 +475,8 @@ def cmd_verify(rest: List[str]) -> int:
         return 2
 
     result = run_checks(opts["repo"], opts["commit"], expect_substring,
-                        expect_file, test_cmd, test_timeout)
+                        expect_file, test_cmd, test_timeout,
+                        expect_definition=expect_definition)
 
     updated = now if now is not None else _now_iso()
     data["updated"] = updated
