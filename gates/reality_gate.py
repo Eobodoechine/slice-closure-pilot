@@ -26,21 +26,27 @@ Binding checks -- `--expect-substring` vs `--expect-definition`:
   distinguish "the symbol was defined" from "the symbol was mentioned", and
   --expect-file does not change that (it only narrows which text is searched).
   Prefer --expect-definition, which parses the committed blob with `ast` and
-  requires a real def/async def/class binding. Keep --expect-substring only for
-  assertions that genuinely are about text (a config value, a version string).
+  requires a real MODULE-LEVEL def/async def/class binding that the change under
+  test introduced. Keep --expect-substring only for assertions that genuinely are
+  about text (a config value, a version string).
+
+  --base-ref sets what "the change under test" means: with it, the range
+  base..commit (what a PR proposes); without it, just that one commit. CI should
+  always pass it -- otherwise a multi-commit PR is judged on its tip alone.
 
 Subcommands:
   check --repo <path> --commit <hash|HEAD>
         [--expect-substring <str>] [--expect-definition <identifier>]
-        [--expect-file <relpath>] [--test-cmd <cmd>] [--test-timeout N]
+        [--expect-file <relpath>] [--base-ref <ref>]
+        [--test-cmd <cmd>] [--test-timeout N]
       Read-only. Runs ground-truth checks and prints a JSON result. Writes nothing.
       Imposes no binding-check requirement. Exit 0 iff passed, else 1.
 
   verify --status-json <path> --item <id-or-exact-title>
          --repo <path> --commit <hash|HEAD>
          [--expect-substring <str>] [--expect-definition <identifier>]
-         [--expect-file <relpath>] [--test-cmd <cmd>] [--test-timeout N]
-         [--log <path>] [--now <iso8601>]
+         [--expect-file <relpath>] [--base-ref <ref>]
+         [--test-cmd <cmd>] [--test-timeout N] [--log <path>] [--now <iso8601>]
       Runs the SAME checks as `check`, then -- iff they pass -- atomically marks the
       located item verified. REQUIRES at least one binding check (--expect-substring,
       --expect-definition, and/or --test-cmd). Exit 0 on pass-and-write, 1 on
@@ -56,8 +62,10 @@ Exit codes:
   2  usage error, item not found/ambiguous, bad status.json, or existing init path.
      Named reason tokens appear in the stdout JSON: "no-binding-check",
      "test-timeout", "bad-status-json", "substring-absent", "definition-absent",
-     "definition-unsupported-language", "definition-unparseable",
-     "definition-unreadable".
+     "definition-preexisting" (defined, but already there at the base -- this
+     change did not land it), "definition-file-untouched" (--expect-file names a
+     path the change never touched), "definition-unsupported-language",
+     "definition-unparseable", "definition-unreadable".
 """
 import ast
 import json
@@ -159,67 +167,134 @@ def _substring_present(repo: str, sha: str, substring: str,
     return any(substring in line for line in added)
 
 
-def _changed_paths(repo: str, sha: str) -> Optional[List[str]]:
-    """Paths the commit added or modified (deletions excluded -- a deleted file
-    cannot hold a definition). None on git failure."""
-    r = _git(repo, "show", sha, "--name-only", "--format=", "--diff-filter=d")
+def _changed_paths(repo: str, sha: str,
+                   base_ref: Optional[str]) -> Optional[List[str]]:
+    """Paths added or modified by the change under test (deletions excluded -- a
+    deleted file cannot hold a definition). None on git failure.
+
+    With `base_ref`, this is the whole range base..sha, which is what a PR
+    actually proposes. Without it, just the single commit -- so a multi-commit PR
+    whose tip is a docs tweak is judged on that tip alone. Always pass a base ref
+    from CI.
+
+    `core.quotePath=false` matters: by default git C-quotes non-ASCII paths
+    ("src/caf\\303\\251.py"), which then fail a plain .py suffix test and silently
+    drop the file from consideration.
+    """
+    if base_ref is not None:
+        r = _git(repo, "-c", "core.quotePath=false", "diff", "--name-only",
+                 "--diff-filter=d", "%s..%s" % (base_ref, sha))
+    else:
+        r = _git(repo, "-c", "core.quotePath=false", "show", sha,
+                 "--name-only", "--format=", "--diff-filter=d")
     if r is None or r.returncode != 0:
         return None
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
-def _definition_present(repo: str, sha: str, name: str,
-                        expect_file: Optional[str]) -> Tuple[bool, Optional[str]]:
-    """Whether `name` is genuinely DEFINED in the committed tree at `sha`.
+def _is_test_path(path: str) -> bool:
+    """Whether `path` is test code. A symbol that exists only in a test is not a
+    landed capability -- defining it there is one of the ways a hollow slice can
+    otherwise satisfy this check."""
+    parts = path.split("/")
+    if any(p in ("tests", "test", "testing", "__tests__") for p in parts):
+        return True
+    base = parts[-1]
+    return base.startswith("test_") or base.endswith("_test.py")
 
-    Parses the committed blob with `ast`, so `name` must appear as a real
-    `def` / `async def` / `class` binding. A mention inside a comment, a
-    docstring, or any string literal can never satisfy this.
 
-    That is the entire reason this check exists. `--expect-substring` is
-    satisfied by ANY added patch line containing the string, so a commit whose
-    only mention of the pinned symbol is `# TODO: def foo` passes it -- and
-    `--expect-file` does not help, because it still does a raw `in` against the
-    blob. A hollow slice that defines nothing therefore verified green. The
-    known real-world instance: a proof branch whose sole matching line was its
-    own docstring saying the file "deliberately does NOT contain
-    `def validate_pilot_input`" -- the disclaimer satisfied the gate.
+def _module_level_defs(repo: str, ref: str, path: str) -> Optional[set]:
+    """The names bound at MODULE level by a def/async def/class in `path` at `ref`.
+    None if the blob is unreadable or does not parse as Python.
 
-    Scope: `--expect-file` restricts the search to that one path; otherwise every
-    .py path the commit touched is parsed. Python only, deliberately -- anything
-    else returns "definition-unsupported-language" rather than falling back to a
-    fuzzy text match, since fuzziness is the defect being closed here.
+    Deliberately `tree.body`, not `ast.walk`: walking counts a definition anywhere
+    in the file, including positions that never bind an importable module
+    attribute -- inside `if False:`, under `if TYPE_CHECKING:`, nested in another
+    function, or as a method on a class. Each of those is a way to satisfy the
+    check with something that does not exist at runtime.
     """
+    blob = subprocess_git_bytes(repo, "%s:%s" % (ref, path))
+    if blob is None:
+        return None
+    try:
+        tree = ast.parse(blob.decode("utf-8", errors="replace"))
+    except (SyntaxError, ValueError):
+        return None
+    return {
+        node.name for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+
+def _definition_present(repo: str, sha: str, name: str,
+                        expect_file: Optional[str],
+                        base_ref: Optional[str]) -> Tuple[bool, Optional[str]]:
+    """Whether the change under test ITSELF landed `name` as a module-level
+    definition.
+
+    Two conditions, both required:
+      1. `name` is bound at module level by a def/async def/class at `sha`
+         (parsed with `ast`, so a comment, docstring, or string literal can never
+         satisfy it -- that is the hole this check exists to close);
+      2. it was NOT already bound in that same file at the base, so a commit that
+         merely TOUCHES a file already defining the symbol cannot claim it.
+
+    Condition 2 is not hypothetical. Without it, appending a blank line to a file
+    that already defines the symbol verifies green while adding zero definitions
+    -- which is precisely the failure this check was written to prevent.
+
+    Test code is excluded: a symbol that exists only under tests/ is not a landed
+    capability. An explicit `expect_file` overrides that, so a deliberately
+    pinned test path is still honoured.
+
+    Python only, deliberately -- anything else fails closed rather than falling
+    back to a fuzzy text match, since fuzziness is the defect being closed.
+
+    KNOWN LIMIT: static analysis cannot see a decorator that rebinds the name to
+    something else (`@_replace def foo` leaving `foo is None`). Condition 1 is
+    "a module-level def/class statement exists", not "importing it yields a
+    callable"; only executing the module could prove the latter.
+    """
+    changed = _changed_paths(repo, sha, base_ref)
+    if changed is None:
+        return False, "definition-unreadable"
+
     if expect_file is not None:
+        if expect_file not in changed:
+            # Otherwise the check stops depending on the commit at all: in any
+            # repo where the symbol already exists, a pinned expect_file would
+            # make this permanently true.
+            return False, "definition-file-untouched"
         candidates: List[str] = [expect_file]
     else:
-        changed = _changed_paths(repo, sha)
-        if changed is None:
-            return False, "definition-unreadable"
-        candidates = changed
+        candidates = [p for p in changed if not _is_test_path(p)]
 
     py_candidates = [p for p in candidates if p.endswith(".py")]
     if not py_candidates:
         return False, "definition-unsupported-language"
 
+    base = base_ref if base_ref is not None else "%s^" % sha
     parsed_any = False
+    found_but_preexisting = False
+
     for path in py_candidates:
-        blob = subprocess_git_bytes(repo, "%s:%s" % (sha, path))
-        if blob is None:
-            continue
-        try:
-            tree = ast.parse(blob.decode("utf-8", errors="replace"))
-        except (SyntaxError, ValueError):
+        now = _module_level_defs(repo, sha, path)
+        if now is None:
             continue
         parsed_any = True
-        for node in ast.walk(tree):
-            if isinstance(
-                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            ) and node.name == name:
-                return True, None
+        if name not in now:
+            continue
+        before = _module_level_defs(repo, base, path)
+        # `before is None` == the file did not exist (or did not parse) at the
+        # base, so anything it defines now is new here.
+        if before is None or name not in before:
+            return True, None
+        found_but_preexisting = True
 
     if not parsed_any:
         return False, "definition-unparseable"
+    if found_but_preexisting:
+        return False, "definition-preexisting"
     return False, "definition-absent"
 
 
@@ -261,7 +336,8 @@ def _test_passes(repo: str, cmd: str, timeout: int) -> Tuple[bool, Optional[str]
 def run_checks(repo: str, commit: str, expect_substring: Optional[str],
                expect_file: Optional[str], test_cmd: Optional[str],
                test_timeout: int,
-               expect_definition: Optional[str] = None) -> Dict:
+               expect_definition: Optional[str] = None,
+               base_ref: Optional[str] = None) -> Dict:
     """Run the ground-truth checks and return the result dict:
       {"passed": bool, "commit": <sha-or-None>,
        "checks": {"commit-is-real": bool, "substring-present": bool/None,
@@ -295,7 +371,7 @@ def run_checks(repo: str, commit: str, expect_substring: Optional[str],
             definition_check, def_reason = False, "definition-absent"
         else:
             definition_check, def_reason = _definition_present(
-                repo, sha, expect_definition, expect_file)
+                repo, sha, expect_definition, expect_file, base_ref)
         if definition_check is False:
             reasons.append(def_reason or "definition-absent")
 
@@ -362,6 +438,7 @@ def cmd_check(rest: List[str]) -> int:
     expect_substring = opts.get("expect-substring")
     expect_definition = opts.get("expect-definition")
     expect_file = opts.get("expect-file")
+    base_ref = opts.get("base-ref")
     test_cmd = opts.get("test-cmd")
 
     if expect_file is not None and expect_substring is None \
@@ -379,7 +456,7 @@ def cmd_check(rest: List[str]) -> int:
 
     result = run_checks(opts["repo"], opts["commit"], expect_substring,
                         expect_file, test_cmd, test_timeout,
-                        expect_definition=expect_definition)
+                        expect_definition=expect_definition, base_ref=base_ref)
     print(json.dumps(result))
     return 0 if result["passed"] else 1
 
@@ -414,6 +491,7 @@ def cmd_verify(rest: List[str]) -> int:
     expect_substring = opts.get("expect-substring")
     expect_definition = opts.get("expect-definition")
     expect_file = opts.get("expect-file")
+    base_ref = opts.get("base-ref")
     test_cmd = opts.get("test-cmd")
     log = opts.get("log")
     now = opts.get("now")
@@ -476,7 +554,7 @@ def cmd_verify(rest: List[str]) -> int:
 
     result = run_checks(opts["repo"], opts["commit"], expect_substring,
                         expect_file, test_cmd, test_timeout,
-                        expect_definition=expect_definition)
+                        expect_definition=expect_definition, base_ref=base_ref)
 
     updated = now if now is not None else _now_iso()
     data["updated"] = updated

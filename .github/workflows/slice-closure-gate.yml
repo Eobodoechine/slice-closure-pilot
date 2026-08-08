@@ -65,7 +65,12 @@ jobs:
       - name: Run reality_gate check at PR head with base-pinned assertions
         run: |
           set -euo pipefail
-          ARGS=(check --repo "$GITHUB_WORKSPACE" --commit "${{ github.event.pull_request.head.sha }}")
+          BASE="${{ github.event.pull_request.base.sha }}"
+          # --base-ref makes the definition check evaluate base..head, i.e. what
+          # the PR actually proposes. Without it the gate judges the tip commit
+          # alone, so a multi-commit PR that lands the symbol early and tips with
+          # a docs tweak would be wrongly blocked.
+          ARGS=(check --repo "$GITHUB_WORKSPACE" --commit "${{ github.event.pull_request.head.sha }}" --base-ref "$BASE")
           [ -n "${{ steps.contract.outputs.sub }}" ] && ARGS+=(--expect-substring "${{ steps.contract.outputs.sub }}")
           [ -n "${{ steps.contract.outputs.dfn }}" ] && ARGS+=(--expect-definition "${{ steps.contract.outputs.dfn }}")
           [ -n "${{ steps.contract.outputs.file }}" ] && ARGS+=(--expect-file "${{ steps.contract.outputs.file }}")

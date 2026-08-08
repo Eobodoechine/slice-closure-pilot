@@ -13,10 +13,17 @@ slice_id: "SLICE-PILOT-001"
 # it narrows which text is searched, then still does a raw match.
 expect_definition: "validate_pilot_input"
 
-# expect_file: ""            # optional: restrict the search to one path
+# expect_file: ""            # optional: restrict the search to one path. The change
+#                            # must actually TOUCH that path, else the check would be
+#                            # permanently true in any repo already defining the symbol.
 # expect_substring: ""       # raw text match -- only for assertions genuinely about
 #                            # text (a version string, a config value), never for
 #                            # "this symbol exists". See reality_gate.py's docstring.
+#
+# expect_definition requires the change to INTRODUCE the name at MODULE level.
+# Not satisfied by: a method on a class, a def nested in another function, a def under
+# `if False:` or `if TYPE_CHECKING:`, a definition only under tests/, or merely touching
+# a file that already defines it (-> definition-preexisting).
 
 test_cmd: "python3 -m pytest -q"
 test_timeout: 600
