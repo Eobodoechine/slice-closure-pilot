@@ -20,40 +20,53 @@ A verdict of `passed: true` means every check that ran passed:
 
 ### What `definition-present` requires, exactly
 
-Both conditions, or it blocks:
+The symbol must be a **module-level** `def`/`async def`/`class` in **production
+code** at the head commit, and **absent** from production code at the **merge base**.
 
-1. the name is bound **at module level** (`tree.body`) at the head commit, and
-2. it was **not already bound in that same file at the base** — so a change that
-   merely *touches* a file already defining the symbol cannot claim it.
+It compares whole-tree presence at two commits. It does *not* diff paths. Per-path
+range diffing was the wrong primitive and leaked twice: an unrebased branch whose
+base had renamed the defining file scored that file's stale copy as newly
+introduced, and a pure rename (0 insertions, 0 deletions) counted as landing the
+symbol. Tree presence has no such edge — if it existed anywhere in production code
+at the merge base, this change did not land it.
 
-Condition 2 is not decoration. Without it, appending a blank line to a file that
-already defines the symbol verifies green while adding zero definitions — which is
-exactly the failure the check exists to prevent. Condition 1 excludes positions that
-look like definitions but never bind an importable attribute: `if False:`,
-`if TYPE_CHECKING:`, functions nested inside other functions, and methods on a class.
+The **merge base**, not the base tip. `base..head` is a tree-to-tree diff; what a PR
+proposes is `base...head`. With the tip, a base commit that *deletes* the definer
+makes a stale branch's leftover copy look new, and it verifies green.
+
+Not satisfied by: a method on a class, a def nested in another function, a def under
+`if False:` or `if TYPE_CHECKING:`, a module-level `def` later `del`-eted, or a
+definition living only in `tests/`, `__tests__/`, `docs/`, `examples/`, `conftest.py`,
+`test_*.py`, or `*_test.py`.
 
 Consequences worth knowing before you hit them:
 
-- **CI must pass `--base-ref`.** The workflow does. It makes the check evaluate
-  `base..head` — what the PR actually proposes. Without it the gate judges the tip
-  commit alone, so a multi-commit PR that lands the symbol early and tips with a docs
-  tweak is wrongly blocked. There is a test pinning both behaviours.
+- **CI must pass `--base-ref`.** The workflow does. Without it the gate falls back to
+  the tip commit's parent, so a multi-commit PR is judged on its last commit alone.
+  Both behaviours are pinned by tests.
 - **A method is not the symbol.** `class Validator: def foo` does not satisfy
-  `expect_definition: foo`. Pin the class name if the class is the deliverable. This
-  is a deliberate spec decision, not an oversight.
-- **Definitions under `tests/`, or in `test_*.py` / `*_test.py`, do not count** — a
-  symbol that exists only in a test is not a landed capability. An explicit
-  `expect_file` overrides this if you really do mean a test path.
-- **`expect_file` must name a path the change actually touched**
-  (`definition-file-untouched`). Otherwise, in any repo where the symbol already
-  exists, pinning it would make the check permanently true regardless of the commit.
+  `expect_definition: foo`. Pin the class name if the class is the deliverable. A
+  deliberate spec decision, not an oversight.
+- **Shipped packages named `testing/` are production code.** Only `tests/`,
+  `__tests__/`, `docs/`, `examples/` directories are excluded, plus pytest's own
+  collection patterns. An earlier revision excluded any segment named `test` or
+  `testing` and wrongly blocked `src/testing/factories.py` — a real layout
+  (`django.test`, pytest plugins).
 - **Once a slice has landed, re-running its contract blocks** with
-  `definition-preexisting`. For a slice-*closure* gate that is the intended reading:
-  the slice is already closed.
+  `definition-preexisting`. Concretely: the merged builder commit `de3ddcb` blocks
+  against base `2bb1558`, because `2bb1558` had already landed the symbol. For a
+  slice-*closure* gate that is the intended reading — the slice was already closed.
+- **Everything unreadable fails closed.** An unparseable base blob yields
+  `definition-unparseable`, not "absent, therefore new". A malformed `--base-ref`
+  (empty, or starting with `-`) is rejected outright: a leading-dash value was
+  otherwise parsed by git as an option, and `--output=` really did create a file.
 - **Known limit:** a decorator that rebinds the name (`@_kill def foo` leaving
-  `foo is None`) still passes. "A module-level def statement exists" is statically
-  decidable; "importing it yields a callable" is not. Pinned as a characterization
-  test so the limit stays visible.
+  `foo is None`) still passes. The check is "a module-level `def`/`class` statement
+  binds this name", which is decidable; "importing the module yields a callable" is
+  not, and no sound static rule separates a nulling decorator from `@functools.cache`
+  — which this suite requires to pass. Note the gate *does* already execute head-tree
+  code via `test_cmd`, so this is a choice about what the check means, not a
+  limitation of what the gate is able to run.
 
 ## Why the contract pins `expect_definition`, not `expect_substring`
 
@@ -90,13 +103,16 @@ a version string, a config value. Never for "this symbol exists".
 
 ### Scope and limits
 
-- **Python only.** A non-`.py` file returns `definition-unsupported-language` and fails
-  closed rather than falling back to a fuzzy text match — fuzziness is the defect being
-  closed. Adding a language means adding a parser, not a regex.
-- Unparseable Python fails closed (`definition-unparseable`).
-- Without `expect_file`, every `.py` path the commit touched is parsed. With it, only
-  that path — which is what `expect_file` is genuinely good for once the check is
-  AST-based.
+- **Python only.** A non-`.py` file simply yields no candidates and the check reports
+  `definition-absent` — it never falls back to a fuzzy text match, because fuzziness is
+  the defect being closed. Adding a language means adding a parser, not a regex.
+- Unparseable Python fails closed (`definition-unparseable`), on either side.
+- `expect_file` scopes the **head** search to one path. It deliberately does *not*
+  scope the base lookup: a symbol that merely moved into the pinned path was not landed
+  by this change.
+- Candidate files are found with a `git grep` pre-filter and confirmed with `ast`, so
+  the whole tree is never parsed. The pre-filter is over-inclusive by design — it also
+  matches nested and dead-code definitions, and the AST is what decides.
 - The guarantee is still bounded: the gate is invoked by the party it constrains, so it
   defends against hallucinated completion, not a determined forger.
 
@@ -115,13 +131,27 @@ but is real: that `expect_substring` does green-light a hollow slice, and that d
 rebinding passes the definition check. Those document limits rather than hiding them; if
 anyone changes either, the test fails loudly and forces this README to be updated with it.
 
-An independent verifier pass on the first revision of this check found **eight false-pass
-classes** — `if False:`, nested defs, `TYPE_CHECKING`, methods, test-only definitions,
-touching a file that already defined the symbol, decorator rebinding, and `del` after
-def — plus a false-negative on non-ASCII filenames (git C-quotes them, so the path failed
-a `.py` suffix test and vanished). All but decorator rebinding are now blocked, and each
-has a regression test. Every one of those tests was mutation-checked: reverting the
-specific behaviour it protects makes it fail.
+Two independent verifier passes shaped this file. The first found **eight false-pass
+classes** against the original check — `if False:`, nested defs, `TYPE_CHECKING`,
+methods, test-only definitions, touching a file that already defined the symbol,
+`del` after def, and decorator rebinding — plus a false negative on non-ASCII
+filenames. The second defeated the *fix*, finding five more: a stale branch plus a
+rename on the base, a pure rename, an unparseable base blob read as "absent", an
+empty `--base-ref`, and git option injection through that flag. **All are now blocked
+except decorator rebinding**, which is documented above as a deliberate limit. Each
+has a regression test.
+
+Every one of those tests was mutation-checked — and mutation testing repeatedly earned
+its place. It caught that the stale-branch test passed whether or not the merge base
+was used, so it never actually pinned that fix; `test_merge_base_not_base_tip` exists
+because of that, and constructs the one shape that discriminates.
+
+`test_a_plain_new_definition_is_found` is the most important test here despite being
+the most boring. The candidate pre-filter is a `git grep -E` regex, and **POSIX ERE
+does not support `\b`** — a revision using it matched nothing, exited 1
+indistinguishably from "no candidates", and silently blocked *everything*. Every
+adversarial test still passed, because they all expect a block. Only a positive
+control separates "correctly refusing" from "broken and refusing everything".
 
 **Fixture rule**, learned from `t3-hollow` defeating itself: a hollow fixture's own text
 — comments, docstrings, commit message — must not accidentally satisfy the assertion

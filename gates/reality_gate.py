@@ -62,10 +62,9 @@ Exit codes:
   2  usage error, item not found/ambiguous, bad status.json, or existing init path.
      Named reason tokens appear in the stdout JSON: "no-binding-check",
      "test-timeout", "bad-status-json", "substring-absent", "definition-absent",
-     "definition-preexisting" (defined, but already there at the base -- this
-     change did not land it), "definition-file-untouched" (--expect-file names a
-     path the change never touched), "definition-unsupported-language",
-     "definition-unparseable", "definition-unreadable".
+     "definition-preexisting" (already defined at the merge base -- this change
+     did not land it), "definition-bad-base-ref", "definition-unparseable",
+     "definition-unreadable".
 """
 import ast
 import json
@@ -167,51 +166,33 @@ def _substring_present(repo: str, sha: str, substring: str,
     return any(substring in line for line in added)
 
 
-def _changed_paths(repo: str, sha: str,
-                   base_ref: Optional[str]) -> Optional[List[str]]:
-    """Paths added or modified by the change under test (deletions excluded -- a
-    deleted file cannot hold a definition). None on git failure.
+def _is_non_production_path(path: str) -> bool:
+    """Paths whose contents are not shipped capability. A symbol that exists only
+    in a test, a doc, or an example is not a landed slice.
 
-    With `base_ref`, this is the whole range base..sha, which is what a PR
-    actually proposes. Without it, just the single commit -- so a multi-commit PR
-    whose tip is a docs tweak is judged on that tip alone. Always pass a base ref
-    from CI.
-
-    `core.quotePath=false` matters: by default git C-quotes non-ASCII paths
-    ("src/caf\\303\\251.py"), which then fail a plain .py suffix test and silently
-    drop the file from consideration.
+    Deliberately NARROW on directory names: an earlier revision excluded any
+    segment named `test`/`testing`, which wrongly blocked shipped packages like
+    `src/testing/factories.py` (django.test, pytest plugins, mypkg/testing/ are
+    all real layouts).
     """
-    if base_ref is not None:
-        r = _git(repo, "-c", "core.quotePath=false", "diff", "--name-only",
-                 "--diff-filter=d", "%s..%s" % (base_ref, sha))
-    else:
-        r = _git(repo, "-c", "core.quotePath=false", "show", sha,
-                 "--name-only", "--format=", "--diff-filter=d")
-    if r is None or r.returncode != 0:
-        return None
-    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
-
-
-def _is_test_path(path: str) -> bool:
-    """Whether `path` is test code. A symbol that exists only in a test is not a
-    landed capability -- defining it there is one of the ways a hollow slice can
-    otherwise satisfy this check."""
     parts = path.split("/")
-    if any(p in ("tests", "test", "testing", "__tests__") for p in parts):
+    if any(p in ("tests", "__tests__", "docs", "examples") for p in parts[:-1]):
         return True
     base = parts[-1]
+    if base == "conftest.py":
+        return True
     return base.startswith("test_") or base.endswith("_test.py")
 
 
 def _module_level_defs(repo: str, ref: str, path: str) -> Optional[set]:
-    """The names bound at MODULE level by a def/async def/class in `path` at `ref`.
-    None if the blob is unreadable or does not parse as Python.
+    """The names bound at MODULE level by a def/async def/class in `path` at `ref`,
+    minus any that a module-level `del` unbinds. None if the blob is unreadable or
+    does not parse as Python.
 
     Deliberately `tree.body`, not `ast.walk`: walking counts a definition anywhere
     in the file, including positions that never bind an importable module
     attribute -- inside `if False:`, under `if TYPE_CHECKING:`, nested in another
-    function, or as a method on a class. Each of those is a way to satisfy the
-    check with something that does not exist at runtime.
+    function, or as a method on a class.
     """
     blob = subprocess_git_bytes(repo, "%s:%s" % (ref, path))
     if blob is None:
@@ -220,82 +201,117 @@ def _module_level_defs(repo: str, ref: str, path: str) -> Optional[set]:
         tree = ast.parse(blob.decode("utf-8", errors="replace"))
     except (SyntaxError, ValueError):
         return None
-    return {
-        node.name for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    }
+    names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Delete):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.discard(target.id)
+    return names
+
+
+def _candidate_paths(repo: str, ref: str, name: str) -> Optional[List[str]]:
+    """.py paths at `ref` that could plausibly define `name`. A cheap regex
+    pre-filter so the whole tree need not be parsed -- the AST still decides.
+    Over-inclusive by design (it matches nested and dead-code defs too).
+    None on git failure; [] legitimately means no candidates."""
+    # POSIX ERE: `\b` is NOT supported by git grep -E -- it matches nothing and
+    # exits 1, which is indistinguishable from "no candidates" and would make
+    # every definition invisible. Spell the word boundary out.
+    pattern = (r"^[[:space:]]*(async[[:space:]]+)?(def|class)[[:space:]]+"
+               r"%s([^A-Za-z0-9_]|$)" % name)
+    r = _git(repo, "-c", "core.quotePath=false", "grep", "-l", "-I", "-E",
+             pattern, ref, "--", "*.py")
+    if r is None or r.returncode not in (0, 1):
+        return None
+    prefix = "%s:" % ref
+    return [ln[len(prefix):] for ln in r.stdout.splitlines()
+            if ln.startswith(prefix)]
+
+
+def _defines_at(repo: str, ref: str, name: str,
+                expect_file: Optional[str]) -> Tuple[Optional[bool], Optional[str]]:
+    """Whether `name` is a module-level definition in production code at `ref`.
+    (None, reason) when it cannot be determined -- callers must fail closed on it,
+    since "I could not read it" is not "it was not there"."""
+    paths = _candidate_paths(repo, ref, name)
+    if paths is None:
+        return None, "definition-unreadable"
+    if expect_file is not None:
+        paths = [p for p in paths if p == expect_file]
+    else:
+        paths = [p for p in paths if not _is_non_production_path(p)]
+    for path in paths:
+        defs = _module_level_defs(repo, ref, path)
+        if defs is None:
+            # Present but unparseable. Cannot prove presence OR absence here.
+            return None, "definition-unparseable"
+        if name in defs:
+            return True, None
+    return False, None
+
+
+def _merge_base(repo: str, base_ref: str, sha: str) -> Optional[str]:
+    r = _git(repo, "merge-base", base_ref, sha)
+    if r is None or r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
 
 
 def _definition_present(repo: str, sha: str, name: str,
                         expect_file: Optional[str],
                         base_ref: Optional[str]) -> Tuple[bool, Optional[str]]:
     """Whether the change under test ITSELF landed `name` as a module-level
-    definition.
+    definition: absent from production code at the merge base, present at head.
 
-    Two conditions, both required:
-      1. `name` is bound at module level by a def/async def/class at `sha`
-         (parsed with `ast`, so a comment, docstring, or string literal can never
-         satisfy it -- that is the hole this check exists to close);
-      2. it was NOT already bound in that same file at the base, so a commit that
-         merely TOUCHES a file already defining the symbol cannot claim it.
+    Compares WHOLE-TREE presence at two commits rather than diffing per path.
+    Per-path range diffing was the wrong primitive and leaked two ways -- an
+    unrebased branch whose base had renamed the defining file scored that file's
+    stale copy as newly introduced, and a pure rename (0 insertions, 0 deletions)
+    counted as landing the symbol. Tree presence has no such edge: if it existed
+    anywhere in production code at the merge base, it was not landed here.
 
-    Condition 2 is not hypothetical. Without it, appending a blank line to a file
-    that already defines the symbol verifies green while adding zero definitions
-    -- which is precisely the failure this check was written to prevent.
+    The MERGE BASE, not the base tip: `base..head` is a tree-to-tree diff, while
+    what a PR proposes is `base...head`. Using the tip is what let a stale branch
+    claim a symbol it never wrote.
 
-    Test code is excluded: a symbol that exists only under tests/ is not a landed
-    capability. An explicit `expect_file` overrides that, so a deliberately
-    pinned test path is still honoured.
+    Unreadable or unparseable inputs fail CLOSED. "I could not determine it" must
+    never read as "it is new".
 
-    Python only, deliberately -- anything else fails closed rather than falling
-    back to a fuzzy text match, since fuzziness is the defect being closed.
-
-    KNOWN LIMIT: static analysis cannot see a decorator that rebinds the name to
-    something else (`@_replace def foo` leaving `foo is None`). Condition 1 is
-    "a module-level def/class statement exists", not "importing it yields a
-    callable"; only executing the module could prove the latter.
+    KNOWN LIMIT: a decorator that rebinds the name (`@_kill def foo` leaving
+    `foo is None`) still satisfies this. The check is "a module-level def/class
+    statement binds this name", which is decidable; "importing the module yields
+    a callable" is not, and no sound static rule separates a nulling decorator
+    from `@functools.cache`.
     """
-    changed = _changed_paths(repo, sha, base_ref)
-    if changed is None:
-        return False, "definition-unreadable"
-
-    if expect_file is not None:
-        if expect_file not in changed:
-            # Otherwise the check stops depending on the commit at all: in any
-            # repo where the symbol already exists, a pinned expect_file would
-            # make this permanently true.
-            return False, "definition-file-untouched"
-        candidates: List[str] = [expect_file]
+    if base_ref is not None:
+        if not base_ref.strip() or base_ref.startswith("-"):
+            return False, "definition-bad-base-ref"
+        base = _merge_base(repo, base_ref, sha)
+        if base is None:
+            return False, "definition-unreadable"
     else:
-        candidates = [p for p in changed if not _is_test_path(p)]
+        # No parent (root commit) => nothing existed before it.
+        base = _resolve_commit(repo, "%s^" % sha)
 
-    py_candidates = [p for p in candidates if p.endswith(".py")]
-    if not py_candidates:
-        return False, "definition-unsupported-language"
+    head_has, reason = _defines_at(repo, sha, name, expect_file)
+    if head_has is None:
+        return False, reason
+    if not head_has:
+        return False, "definition-absent"
+    if base is None:
+        return True, None
 
-    base = base_ref if base_ref is not None else "%s^" % sha
-    parsed_any = False
-    found_but_preexisting = False
-
-    for path in py_candidates:
-        now = _module_level_defs(repo, sha, path)
-        if now is None:
-            continue
-        parsed_any = True
-        if name not in now:
-            continue
-        before = _module_level_defs(repo, base, path)
-        # `before is None` == the file did not exist (or did not parse) at the
-        # base, so anything it defines now is new here.
-        if before is None or name not in before:
-            return True, None
-        found_but_preexisting = True
-
-    if not parsed_any:
-        return False, "definition-unparseable"
-    if found_but_preexisting:
+    # Base side is deliberately NOT scoped by expect_file: a symbol that merely
+    # moved into the pinned path was not landed by this change.
+    base_has, reason = _defines_at(repo, base, name, None)
+    if base_has is None:
+        return False, reason
+    if base_has:
         return False, "definition-preexisting"
-    return False, "definition-absent"
+    return True, None
 
 
 def subprocess_git_bytes(repo: str, spec: str) -> Optional[bytes]:

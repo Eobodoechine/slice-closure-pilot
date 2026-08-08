@@ -229,14 +229,15 @@ def test_non_python_file_fails_closed_rather_than_guessing(tmp_path):
     """No fuzzy fallback for languages the parser does not cover -- fuzziness is
     the defect being closed, so an unsupported language must refuse, not guess."""
     repo = _init_repo(tmp_path)
+    base = _head(repo)
     sha = _commit(repo, "app.js", "function %s(v) { return !!v; }\n" % _SYMBOL,
                   "js slice")
 
     code, out = _run_gate("check", "--repo", str(repo), "--commit", sha,
-                          "--expect-definition", _SYMBOL)
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
 
     assert out["checks"]["definition-present"] is False
-    assert "definition-unsupported-language" in out["reasons"]
+    assert "definition-absent" in out["reasons"]
     assert code == 1
 
 
@@ -366,9 +367,11 @@ def test_definition_only_in_a_test_file_is_not_a_landed_capability(tmp_path):
     assert out["passed"] is False and code == 1
 
 
-def test_expect_file_must_actually_be_touched_by_the_change(tmp_path):
-    """Without this, pinning expect_file in a repo where the symbol already
-    exists turns the check into a permanent true, independent of the commit."""
+def test_expect_file_cannot_make_the_check_commit_independent(tmp_path):
+    """An earlier revision needed a special "was this path touched?" guard here,
+    because pinning expect_file in a repo already defining the symbol made the
+    check permanently true. Comparing against the merge base removes the need for
+    that guard entirely: pre-existing is pre-existing, whatever the commit did."""
     repo = _init_repo(tmp_path)
     _commit(repo, "pilot_app.py", REAL_DEFINITIONS["plain"], "the slice lands")
     base = _head(repo)
@@ -379,7 +382,7 @@ def test_expect_file_must_actually_be_touched_by_the_change(tmp_path):
                           "--expect-file", "pilot_app.py")
 
     assert out["checks"]["definition-present"] is False
-    assert "definition-file-untouched" in out["reasons"]
+    assert "definition-preexisting" in out["reasons"]
     assert code == 1
 
 
@@ -464,3 +467,231 @@ def test_verify_also_rejects_a_def_prefixed_value(tmp_path):
 
     assert code == 2 and out["error"] == "usage_error"
     assert json.loads(status.read_text())["items"][0]["verified"] is False
+
+
+# ---------------------------------------------------------------------------
+# Round-2 verifier findings. The per-path range-diff approach these came from is
+# gone; the check now compares whole-tree presence at the MERGE BASE vs head.
+# ---------------------------------------------------------------------------
+
+def test_stale_branch_plus_rename_on_base_cannot_claim_the_symbol(tmp_path):
+    """S1, the worst of them: reachable in ordinary CI with no adversary. An
+    unrebased branch, plus a routine rename on the base, made the branch's stale
+    copy of the defining file look newly added -- so a PR that defines nothing
+    verified green. Two-dot base..head is a tree-to-tree diff; what a PR proposes
+    is the merge base."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "src/real.py", REAL_DEFINITIONS["plain"], "symbol already exists")
+    fork = _head(repo)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    head = _commit(repo, "notes.py", "notes = 1\n", "PR that defines nothing")
+    _git(repo, "checkout", "-q", "-")
+    _git(repo, "mv", "src/real.py", "src/renamed.py")
+    _git(repo, "commit", "-qm", "base renames the definer")
+    base = _head(repo)
+    assert fork != base
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert "definition-preexisting" in out["reasons"]
+    assert code == 1
+
+
+def test_a_pure_rename_does_not_land_the_symbol(tmp_path):
+    """S2: a commit with literally 0 insertions and 0 deletions scored as having
+    introduced the symbol, because `before` was looked up at the same path -- and
+    that path did not exist at the base."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "src/real.py", REAL_DEFINITIONS["plain"], "symbol already exists")
+    base = _head(repo)
+    _git(repo, "mv", "src/real.py", "src/renamed.py")
+    _git(repo, "commit", "-qm", "pure rename")
+    head = _head(repo)
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert "definition-preexisting" in out["reasons"]
+    assert code == 1
+
+
+def test_unparseable_base_blob_fails_closed_not_open(tmp_path):
+    """S3: an unreadable base was treated as "the file did not exist, so this is
+    new". A commit that only removed a stray conflict marker could claim the
+    symbol. "I could not determine it" must never read as "it is new"."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "src/b.py",
+            REAL_DEFINITIONS["plain"] + "<<<<<<< HEAD\n", "base has a marker")
+    base = _head(repo)
+    head = _commit(repo, "src/b.py", REAL_DEFINITIONS["plain"], "remove the marker")
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert "definition-unparseable" in out["reasons"]
+    assert code == 1
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "--output=/tmp/should_not_exist"])
+def test_malformed_base_ref_is_rejected_not_silently_ignored(bad, tmp_path):
+    """S4/S5: an empty --base-ref fell through to a HEAD-relative diff and an
+    index read, and failed OPEN. A leading-dash value was parsed by git as an
+    option -- `--output=` really did create a file."""
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    head = _commit(repo, "pilot_app.py", REAL_DEFINITIONS["plain"], "real slice")
+    assert base
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", bad, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert "definition-bad-base-ref" in out["reasons"]
+    assert code == 1
+    assert not os.path.exists("/tmp/should_not_exist")
+
+
+def test_module_level_del_unbinds_the_symbol(tmp_path):
+    """Attack 12. Previously passed while the README claimed it was blocked --
+    a documentation claim the code contradicted. A module-level ast.Delete is
+    decidable in the same pass, so now it genuinely is blocked."""
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    head = _commit(repo, "pilot_app.py",
+                   REAL_DEFINITIONS["plain"] + "del %s\n" % _SYMBOL,
+                   "define then delete")
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert code == 1
+
+
+NON_PRODUCTION_PATHS = [
+    "tests/test_slice.py",      # directory branch
+    "__tests__/thing.py",       # directory branch, alternate name
+    "docs/example.py",          # docs
+    "examples/demo.py",         # examples
+    "test_slice.py",            # filename branch, prefix
+    "slice_test.py",            # filename branch, suffix
+    "conftest.py",              # pytest fixture module
+]
+
+
+@pytest.mark.parametrize("path", NON_PRODUCTION_PATHS)
+def test_definitions_outside_production_code_do_not_count(path, tmp_path):
+    """Each path is listed separately on purpose: a single fixture under
+    tests/test_slice.py satisfies BOTH the directory and the filename branch, so
+    either half could be deleted with the suite still green. A mutation pass
+    found exactly that."""
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    head = _commit(repo, path, REAL_DEFINITIONS["plain"], "define it off to the side")
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False, path
+    assert code == 1
+
+
+@pytest.mark.parametrize("path", ["src/testing/factories.py",
+                                  "mypkg/testing/fakes.py",
+                                  "src/testkit.py"])
+def test_shipped_packages_named_testing_are_production_code(path, tmp_path):
+    """Regression against a false negative this check introduced: excluding any
+    path segment named `test`/`testing` also excluded shipped packages
+    (django.test, pytest plugins, mypkg/testing/) -- real, legitimate layouts.
+
+    Note the boundary: `src/test_helpers.py` is NOT here, and is correctly
+    excluded. `test_*.py` is pytest's own default collection pattern, so such a
+    module really would be collected as a test. The directory segment was the
+    over-reach; the filename pattern is not."""
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    head = _commit(repo, path, REAL_DEFINITIONS["plain"], "shipped testing helper")
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is True, path
+    assert out["passed"] is True and code == 0
+
+
+@pytest.mark.parametrize("use_base_ref", [True, False])
+def test_a_plain_new_definition_is_found(use_base_ref, tmp_path):
+    """The control. Deliberately parameterised over both code paths.
+
+    This is the test that catches a whole-check outage. The candidate pre-filter
+    is a `git grep -E` regex, and POSIX ERE does NOT support `\\b` -- a version
+    using it matched nothing and exited 1, which is indistinguishable from "no
+    candidates", so the gate silently blocked EVERYTHING. Every adversarial case
+    still "passed" because they all expect a block. Only a positive control
+    separates "correctly refusing" from "broken and refusing everything".
+    """
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    head = _commit(repo, "pilot_app.py", REAL_DEFINITIONS["plain"], "real slice")
+
+    args = ["check", "--repo", str(repo), "--commit", head,
+            "--expect-definition", _SYMBOL]
+    if use_base_ref:
+        args += ["--base-ref", base]
+
+    code, out = _run_gate(*args)
+
+    assert out["checks"]["definition-present"] is True
+    assert out["passed"] is True and code == 0
+
+
+@pytest.mark.parametrize("use_base_ref", [True, False])
+def test_non_ascii_filename_found_on_both_code_paths(use_base_ref, tmp_path):
+    """The quotePath fix had coverage only on the --base-ref path; a mutation
+    pass reverted the other branch with the suite still green."""
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    head = _commit(repo, "café.py", REAL_DEFINITIONS["plain"], "unicode path")
+
+    args = ["check", "--repo", str(repo), "--commit", head,
+            "--expect-definition", _SYMBOL]
+    if use_base_ref:
+        args += ["--base-ref", base]
+
+    code, out = _run_gate(*args)
+
+    assert out["checks"]["definition-present"] is True
+    assert out["passed"] is True and code == 0
+
+
+def test_merge_base_not_base_tip(tmp_path):
+    """Pins the merge-base fix specifically. A mutation pass caught that the
+    stale-branch test above passes either way -- whole-tree comparison already
+    blocks that fixture regardless of which base is used, so it never actually
+    exercised merge-base.
+
+    The discriminating case: the base tip DELETES the definer. Comparing against
+    the tip then says "absent at base", so a stale branch still carrying the old
+    copy looks like it introduced the symbol and verifies green. The merge base
+    (the fork point) still has it, which is the truth -- this branch wrote
+    nothing.
+    """
+    repo = _init_repo(tmp_path)
+    _commit(repo, "src/real.py", REAL_DEFINITIONS["plain"], "fork point has it")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    head = _commit(repo, "notes.py", "notes = 1\n", "PR defines nothing")
+    _git(repo, "checkout", "-q", "-")
+    _git(repo, "rm", "-q", "src/real.py")
+    _git(repo, "commit", "-qm", "base tip deletes the definer")
+    tip = _head(repo)
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", tip, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert "definition-preexisting" in out["reasons"]
+    assert code == 1
