@@ -1,0 +1,77 @@
+name: slice-closure-gate
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  slice-closure-gate:
+    name: slice-closure-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head (full history for base access)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Load contract and gate FROM BASE BRANCH ONLY (fail-closed if absent)
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.sha }}"
+          git fetch origin "$BASE" --depth=1 || true
+          mkdir -p /tmp/basegate
+          git show "$BASE:gates/contract.yml"    > /tmp/basegate/contract.yml
+          git show "$BASE:gates/reality_gate.py" > /tmp/basegate/reality_gate.py
+
+      - name: Refuse PRs that touch protected gate paths
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          CHANGED="$(git diff --name-only "$BASE" "$HEAD")"
+          echo "$CHANGED"
+          if echo "$CHANGED" | grep -qE '^(gates/|\.github/workflows/)'; then
+            echo "::error::PR modifies protected gate/workflow paths. Gate changes need a separate governor-approved PR."
+            exit 1
+          fi
+
+      - name: Refuse contracts without binding assertions (closes the cmd_check gap)
+        id: contract
+        run: |
+          set -euo pipefail
+          pip install --quiet pyyaml pytest
+          python3 - <<'EOF'
+          import yaml, sys, os
+          c = yaml.safe_load(open('/tmp/basegate/contract.yml'))
+          sub = (c.get('expect_substring') or '').strip()
+          cmd = (c.get('test_cmd') or '').strip()
+          if not sub and not cmd:
+              print("::error::contract.yml pins neither expect_substring nor test_cmd — refusing (no-binding-contract)")
+              sys.exit(1)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"sub={sub}\n"); f.write(f"cmd={cmd}\n")
+              f.write(f"file={(c.get('expect_file') or '').strip()}\n")
+              f.write(f"timeout={int(c.get('test_timeout') or 600)}\n")
+          EOF
+
+      - name: Run reality_gate check at PR head with base-pinned assertions
+        run: |
+          set -euo pipefail
+          ARGS=(check --repo "$GITHUB_WORKSPACE" --commit "${{ github.event.pull_request.head.sha }}")
+          [ -n "${{ steps.contract.outputs.sub }}" ] && ARGS+=(--expect-substring "${{ steps.contract.outputs.sub }}")
+          [ -n "${{ steps.contract.outputs.file }}" ] && ARGS+=(--expect-file "${{ steps.contract.outputs.file }}")
+          [ -n "${{ steps.contract.outputs.cmd }}" ] && ARGS+=(--test-cmd "${{ steps.contract.outputs.cmd }}")
+          ARGS+=(--test-timeout "${{ steps.contract.outputs.timeout }}")
+          python3 /tmp/basegate/reality_gate.py "${ARGS[@]}" | tee /tmp/verdict.json
+          # exit code of reality_gate propagates via pipefail
+
+      - name: Upload verdict receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slice-closure-receipt-${{ github.event.pull_request.number }}
+          path: /tmp/verdict.json

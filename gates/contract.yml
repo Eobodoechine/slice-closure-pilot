@@ -1,0 +1,7 @@
+# Slice Closure Gate contract. Read ONLY from the base branch by CI.
+# Rule: a PR that edits gates/** or .github/workflows/** fails the gate.
+slice_id: "SLICE-PILOT-001"
+expect_substring: "def validate_pilot_input"
+# expect_file: ""            # optional: restrict substring search to one file
+test_cmd: "python3 -m pytest -q"
+test_timeout: 600
