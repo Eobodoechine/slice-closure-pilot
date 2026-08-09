@@ -1,0 +1,73 @@
+# TEMPORARY -- DELETE BEFORE THE BYPASS MERGE OF PR #9.
+#
+# Why this file exists
+# --------------------
+# PR #9 rewrites the gate's own trigger from `pull_request` to
+# `pull_request_target`, which makes it invisible to CI under BOTH regimes:
+#   - `pull_request` resolves workflow files from the PR head, and the head no
+#     longer declares `pull_request`;
+#   - `pull_request_target` resolves them from the default branch (since
+#     2025-12-08), and main still says `pull_request`.
+# So PR #9 has zero check runs, and the only evidence that its 101-test suite
+# passes is a local log — exactly the self-reported green this repo exists to
+# refuse.
+#
+# Workflow matching is PER FILE, so a *separate* file declaring `pull_request`
+# DOES run from the PR head. This one does, and produces a real CI receipt bound
+# to the head sha. It is deliberately named `suite-proof`, NOT
+# `slice-closure-gate`, so it can never be mistaken for (or spoof) the required
+# check.
+#
+# Delete this file in a follow-up commit before merging. The run stays in the
+# Actions history as the receipt; the file never lands on main.
+
+name: suite-proof
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: suite-proof-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  suite-proof:
+    name: suite-proof
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - run: pip install --quiet pyyaml pytest
+
+      - name: Head test suite (the number the local log claimed)
+        run: python3 -m pytest -q
+
+      - name: Classify the REAL merged history, not fixtures
+        run: |
+          set -euo pipefail
+          lane() { python3 gates/reality_gate.py classify --repo . \
+                     --commit "$1" --base-ref "$2" \
+                   | python3 -c "import sys,json;print(json.load(sys.stdin)['mode'])"; }
+
+          # de3ddcb = merged PR #5, the canonical loop output: a symbol plus its
+          # own tests. Under the all-of-tests/** rule this classified as
+          # gate-change-mixed-with-code and was refused, which would have made
+          # the gate unusable for ordinary work. It must be a slice.
+          got="$(lane de3ddcb de3ddcb^)"
+          echo "PR #5 shape -> $got"
+          [ "$got" = "slice" ] || { echo "::error::PR #5 shape classified $got, want slice"; exit 1; }
+
+          # 2bb1558 = merged PR #2, code only.
+          got="$(lane 2bb1558 2bb1558^)"
+          echo "PR #2 shape -> $got"
+          [ "$got" = "slice" ] || { echo "::error::PR #2 shape classified $got, want slice"; exit 1; }
+
+          # This PR itself touches .github/workflows/**, so the ceremony lane
+          # must claim it. That is the honest verdict, and the reason this PR
+          # can only land through the named bypass actor.
+          got="$(lane "${{ github.event.pull_request.head.sha }}" "${{ github.event.pull_request.base.sha }}")"
+          echo "this PR -> $got"
+          [ "$got" = "workflow-touch" ] || { echo "::error::this PR classified $got, want workflow-touch"; exit 1; }
