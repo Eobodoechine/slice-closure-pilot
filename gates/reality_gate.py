@@ -648,8 +648,12 @@ _WORKFLOW_TREE = ".github/workflows/"
 # gate surface wherever they appear. Cost: a slice PR that also edits
 # pyproject.toml/setup.cfg is refused as mixed and has to split. That is the
 # fail-closed direction, and it is the intended trade.
-_PYTEST_CONTROL_FILES = frozenset((
-    "conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml",
+# Matched only at the repo ROOT: pytest reads these from the rootdir, so a copy
+# in a subpackage does not steer the run the gate performs. Anchoring here
+# instead of matching the basename anywhere avoids refusing an ordinary
+# "add a dependency" PR in a larger repo as gate-change-mixed-with-code.
+_PYTEST_ROOT_CONFIG = frozenset((
+    "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml",
 ))
 
 
@@ -669,7 +673,14 @@ def _is_gate_path(path: str) -> bool:
     touches tests/test_gate_* alongside product code is still refused."""
     if path.startswith(_GATE_TREE) or path.startswith(_GATE_TEST_PREFIX):
         return True
-    return path.rsplit("/", 1)[-1] in _PYTEST_CONTROL_FILES
+    base = path.rsplit("/", 1)[-1]
+    # conftest.py steers collection from ANY directory pytest walks.
+    if base == "conftest.py":
+        return True
+    # tests/**/__init__.py executes at import time inside the gate's own suite.
+    if base == "__init__.py" and path.startswith("tests/"):
+        return True
+    return "/" not in path and base in _PYTEST_ROOT_CONFIG
 
 
 def _classify_lane(changed: List[str]) -> Tuple[str, List[str], List[str], List[str]]:
@@ -751,15 +762,21 @@ def _assertion_classes(blob: bytes) -> Tuple[Optional[set], Optional[str]]:
         return set(), None
     if not isinstance(doc, dict):
         return None, "maintenance-contract-unparseable"
+    # MIRROR THE CONSUMER EXACTLY. The workflow builds the gate's assertions with
+    #     dfn = (c.get('expect_definition') or '').strip()
+    # so ONLY a non-empty string is a real pin. An earlier version also counted
+    # int/float, which reopened the same fail-open one respelling later:
+    # `expect_definition: 0` (also 0.0, -0.0, 0x0, !!int 0) read as pinned here
+    # while `(0 or '').strip()` is '' there -- maintain green, merged gate running
+    # with no definition assertion. A truthy non-string makes the consumer raise
+    # AttributeError and the job die, so reading it as unpinned here is also the
+    # fail-closed direction: maintain sees the class dropped and blocks.
+    # tests/test_gate_maintenance.py pins this against the LITERAL expression
+    # extracted from the workflow, so the two cannot drift apart again.
     found = set()
     for key in CONTRACT_BINDING_KEYS:
         value = doc.get(key)
-        if isinstance(value, bool) or value is None:
-            continue
-        if isinstance(value, str):
-            if value.strip():
-                found.add(key)
-        elif isinstance(value, (int, float)):
+        if isinstance(value, str) and value.strip():
             found.add(key)
     return found, None
 

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import pytest
@@ -141,9 +142,12 @@ def test_classify_code_plus_its_own_tests_is_a_slice(tmp_path):
 @pytest.mark.parametrize("path", [
     "conftest.py",
     "tests/conftest.py",
+    "src/deep/conftest.py",
+    "tests/__init__.py",
     "pytest.ini",
     "setup.cfg",
     "pyproject.toml",
+    "tox.ini",
 ])
 def test_classify_pytest_control_files_are_gate_surface(tmp_path, path):
     """These decide WHAT pytest collects, so they decide what the head suite and
@@ -391,33 +395,125 @@ def test_maintain_refuses_every_spelling_of_an_emptied_assertion(tmp_path, shape
     assert out["dropped_assertion_classes"] == ["expect_definition"]
 
 
-def test_assertion_classes_agrees_with_the_parser_that_builds_the_gate(tmp_path):
+def _workflow_consumer_classes(doc):
+    """What the GATE will actually treat as pinned, computed with the LITERAL
+    expressions lifted out of .github/workflows/slice-closure-gate.yml.
+
+    Deliberately extracted, not reimplemented. The previous version of this
+    oracle restated the rule in its own words and got it wrong in the same
+    direction as the code it was checking (`str(0).strip()` is truthy, but the
+    workflow's `(0 or '').strip()` is ''), so it asserted the fail-open was
+    correct and stayed green. An oracle derived from the implementation cannot
+    catch the implementation. This one breaks if anyone edits the workflow."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    wf = os.path.join(os.path.dirname(here), ".github", "workflows",
+                      "slice-closure-gate.yml")
+    text = open(wf, encoding="utf-8").read()
+    found = set()
+    for key, var in (("expect_substring", "sub"),
+                     ("expect_definition", "dfn"),
+                     ("test_cmd", "cmd")):
+        m = re.search(r"^\s*%s = (\(c\.get\(%r\).*\)\.strip\(\))\s*$"
+                      % (var, key), text, re.M)
+        assert m, "no workflow expression found for %s -- did the step change?" % var
+        try:
+            value = eval(m.group(1), {"__builtins__": {}}, {"c": doc})  # noqa: S307
+        except Exception:
+            # The workflow would raise here and the job would die: not a pin.
+            value = ""
+        if value:
+            found.add(key)
+    return found
+
+
+# Falsy non-strings: `_assertion_classes` once counted int/float as pinned, so
+# each of these reopened the emptied-assertion exploit one respelling later.
+FALSY_SHAPES = {
+    "int-zero": "expect_definition: 0\n",
+    "float-zero": "expect_definition: 0.0\n",
+    "negative-zero": "expect_definition: -0.0\n",
+    "hex-zero": "expect_definition: 0x0\n",
+    "tagged-int-zero": "expect_definition: !!int 0\n",
+    "false": "expect_definition: false\n",
+    "whitespace-only": 'expect_definition: "   "\n',
+}
+
+
+@pytest.mark.parametrize("shape", sorted(FALSY_SHAPES))
+def test_maintain_refuses_falsy_non_string_assertions(tmp_path, shape):
+    repo = _init_repo(tmp_path)
+    _commit(repo, "gates/reality_gate.py", GATE_SOURCE, "gate v1")
+    base = _commit(repo, "gates/contract.yml", CONTRACT_DEFINITION, "base contract")
+    sha = _commit(repo, "gates/contract.yml",
+                  FALSY_SHAPES[shape] + 'test_cmd: "python3 -m pytest -q"\n',
+                  "empty it via %s" % shape)
+    code, out = _run_gate("maintain", "--repo", str(repo),
+                          "--commit", sha, "--base-ref", base)
+    assert out["passed"] is False and code == 1, \
+        "%s evaded assertion-class monotonicity" % shape
+    assert out["dropped_assertion_classes"] == ["expect_definition"]
+
+
+def test_assertion_classes_agrees_with_the_workflow_that_consumes_it(tmp_path):
     """The invariant behind all of the above: whatever maintain believes the
-    contract pins must equal what yaml.safe_load says it pins. If these two ever
-    disagree, maintain is judging a document the gate will not actually run."""
+    contract pins must equal what the workflow will actually assert on. If these
+    two disagree, maintain is authorizing a contract the gate will not enforce."""
     yaml = pytest.importorskip("yaml")
     gate = _load_gate_module()
-    bodies = list(EMPTY_SHAPES.values()) + [
+    bodies = (list(EMPTY_SHAPES.values()) + list(FALSY_SHAPES.values()) + [
         CONTRACT_DEFINITION, CONTRACT_REPOINTED, CONTRACT_TAMPERED,
         CONTRACT_BOUND, CONTRACT_UNBOUND, "", "not-a-mapping\n",
-        'expect_definition: 0\n', 'expect_definition: false\n',
-        'expect_definition: "  "\n',
-    ]
+        'expect_definition: 1\n', 'expect_definition: true\n',
+        'expect_definition: [a, b]\n', 'expect_definition: {a: b}\n',
+        'expect_definition: &a "x"\nexpect_substring: *a\n',
+        'base: &b {expect_definition: "x"}\nmerged:\n  <<: *b\n',
+        'expect_definition: !!str ""\n',
+    ])
     for body in bodies:
         classes, reason = gate._assertion_classes(body.encode())
-        doc = None
         try:
             doc = yaml.safe_load(body)
         except yaml.YAMLError:
-            assert classes is None, body
+            assert classes is None and reason == "maintenance-contract-unparseable", body
+            continue
+        if doc is None:
+            assert classes == set(), body
             continue
         if not isinstance(doc, dict):
-            assert classes is None or classes == set(), body
+            assert classes is None, body
             continue
-        expected = {
-            k for k in gate.CONTRACT_BINDING_KEYS
-            if not isinstance(doc.get(k), bool) and doc.get(k) is not None
-            and (str(doc[k]).strip() if not isinstance(doc[k], str) else doc[k].strip())
-        }
-        assert classes == expected, "%r -> %r, parser says %r" % (body, classes, expected)
+        expected = _workflow_consumer_classes(doc)
+        assert classes == expected, \
+            "%r -> maintain sees %r, the workflow will use %r" % (body, classes, expected)
         assert reason is None
+
+
+def test_maintain_refuses_when_the_contract_cannot_be_parsed(tmp_path):
+    repo = _init_repo(tmp_path)
+    _commit(repo, "gates/reality_gate.py", GATE_SOURCE, "gate v1")
+    base = _commit(repo, "gates/contract.yml", CONTRACT_DEFINITION, "base contract")
+    sha = _commit(repo, "gates/contract.yml", "expect_definition: [unclosed\n", "broken")
+    code, out = _run_gate("maintain", "--repo", str(repo),
+                          "--commit", sha, "--base-ref", base)
+    assert out["passed"] is False and code == 1
+    assert out["reason"] == "maintenance-contract-unparseable"
+
+
+def test_maintain_refuses_rather_than_degrading_when_pyyaml_is_absent(tmp_path):
+    """Reading the contract with a weaker parser would be a silent fallback --
+    exactly how the first version of this check went fail-open. Refuse instead."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "gates/reality_gate.py", GATE_SOURCE, "gate v1")
+    base = _commit(repo, "gates/contract.yml", CONTRACT_DEFINITION, "base contract")
+    sha = _commit(repo, "gates/contract.yml", CONTRACT_TAMPERED, "T2 tamper")
+
+    shim = tmp_path / "noyaml"
+    shim.mkdir()
+    (shim / "yaml.py").write_text("raise ImportError('pyyaml unavailable')\n")
+    env = dict(os.environ, PYTHONPATH=str(shim))
+    r = subprocess.run([sys.executable, GATE, "maintain", "--repo", str(repo),
+                        "--commit", sha, "--base-ref", base],
+                       capture_output=True, text=True, env=env)
+    out = json.loads(r.stdout)
+    assert r.returncode == 1
+    assert out["passed"] is False and out["reason"] == "maintenance-no-yaml"

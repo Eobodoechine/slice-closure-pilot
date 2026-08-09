@@ -27,14 +27,26 @@ classifies every PR by git data alone (`classify` subcommand) into one of four l
 | lane | what changed | verdict |
 |---|---|---|
 | `slice` | nothing under the gate surface or `.github/workflows/**` — **including product code plus its own tests** | normal gate checks |
-| `gate-maintenance` | only the gate surface: `gates/**` and `tests/test_gate_*` | judged by the **base** gate's `maintain` check, then the head's own test suite |
+| `gate-maintenance` | only the gate surface: `gates/**`, `tests/test_gate_*`, and anything steering pytest collection | judged by the **base** gate's `maintain` check, then the head's own test suite |
 | `gate-change-mixed-with-code` | gate surface mixed with other code | **refused** |
 | `workflow-touch` | any `.github/workflows/**` | **refused** — merged only by the bypass actor, always red in the gate |
 
 The gate surface is deliberately **not** all of `tests/**`. A slice that lands a symbol
 and the tests for it — `src/foo.py` + `tests/test_foo.py`, the canonical output of the
-loop — is ordinary work, not an attempt to edit the exam. Only `tests/test_gate_*`, which
-pins the judge's own verdicts, counts as gate surface.
+loop — is ordinary work, not an attempt to edit the exam. The surface is exactly:
+
+- `gates/**` — the judge itself;
+- `tests/test_gate_*` — the tests that pin the judge's verdicts;
+- anything that steers **what pytest collects**, because that decides what the head suite
+  and the base negative matrix actually assert: `conftest.py` at any depth,
+  `tests/**/__init__.py`, and `pytest.ini` / `tox.ini` / `setup.cfg` / `pyproject.toml`
+  **at the repo root** (pytest reads those from the rootdir, so a copy in a subpackage
+  does not steer the run).
+
+A `conftest.py` with `collect_ignore_glob = ["test_gate_*"]` takes this repo's suite from
+129 tests to 4 and still exits 0 — which is why it is gate surface even though it is not a
+test. **Practical consequence:** a PR that edits product code *and* the root
+`pyproject.toml` is refused as `gate-change-mixed-with-code` and has to be split in two.
 
 `maintain` must pass **all** of, fail-closed:
 
