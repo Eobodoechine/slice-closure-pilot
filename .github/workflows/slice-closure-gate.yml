@@ -29,28 +29,38 @@ jobs:
           persist-credentials: false
 
       - name: Load contract and gate FROM BASE BRANCH ONLY (fail-closed if absent)
+        id: base
         run: |
           set -euo pipefail
-          BASE="${{ github.event.pull_request.base.sha }}"
+          # The pull_request_target event's base SHA is a snapshot taken when the
+          # event was queued.  It can be stale after main advances, which loads a
+          # pre-hardening gate for an otherwise current PR.  Fetch and pin the
+          # branch tip once, then pass that immutable SHA to every later step.
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          BASE="$(git rev-parse refs/remotes/origin/main)"
           # NOT --depth=1: that turns the fetch-depth:0 checkout into a shallow
           # repo, after which `git merge-base` has no ancestry to work with and
           # the gate blocks EVERY pr with definition-shallow-repo.
-          git fetch --no-tags origin "$BASE" || true
           git rev-parse --is-shallow-repository
           mkdir -p /tmp/basegate
           git show "$BASE:gates/contract.yml"    > /tmp/basegate/contract.yml
           git show "$BASE:gates/reality_gate.py" > /tmp/basegate/reality_gate.py
+          echo "sha=$BASE" >> "$GITHUB_OUTPUT"
 
       - name: Classify PR lane from git data (unforgeable)
         id: lane
         run: |
-          # Deliberately NOT `set -e`. classify exits 1 for the ceremony lanes,
+          # Deliberately disable `-e`. classify exits 1 for the ceremony lanes,
           # so under errexit this step died before `mode=` was ever written --
           # steps.lane.outputs.mode stayed empty, the annotated refusal step
           # below could never match, and every ceremony PR surfaced as an opaque
-          # step failure with no explanation. Capture the verdict, then refuse.
+          # step failure with no explanation. GitHub invokes run blocks as
+          # `bash -e`, so omitting `set -e` does not undo it; use `set +e`.
+          # Capture the verdict, write both outputs, then let the next step
+          # refuse the lane with the annotated reason.
+          set +e
           set -uo pipefail
-          BASE="${{ github.event.pull_request.base.sha }}"
+          BASE="${{ steps.base.outputs.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
           python3 /tmp/basegate/reality_gate.py classify \
             --repo "$GITHUB_WORKSPACE" --commit "$HEAD" --base-ref "$BASE" \
@@ -131,7 +141,7 @@ jobs:
         id: maintain
         run: |
           set -euo pipefail
-          BASE="${{ github.event.pull_request.base.sha }}"
+          BASE="${{ steps.base.outputs.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
           # maintain reads the contract with the SAME parser that builds the
           # gate's assertions further down. It refuses (maintenance-no-yaml)
@@ -148,7 +158,7 @@ jobs:
         if: steps.lane.outputs.mode == 'gate-maintenance'
         run: |
           set -euo pipefail
-          BASE="${{ github.event.pull_request.base.sha }}"
+          BASE="${{ steps.base.outputs.sha }}"
           pip install --quiet pyyaml pytest
           # Stage base's test_gate_hollow_slice.py next to the head's gates/ so
           # _locate_gate resolves the same layout as in the repo.
@@ -180,7 +190,7 @@ jobs:
           CMD: ${{ steps.contract.outputs.cmd }}
           TIMEOUT: ${{ steps.contract.outputs.timeout }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ steps.base.outputs.sha }}
         run: |
           set -euo pipefail
           # --base-ref makes the definition check evaluate base..head, i.e. what
