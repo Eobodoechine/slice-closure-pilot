@@ -56,16 +56,56 @@ Subcommands:
       Writes a status.json skeleton (empty items) iff --path does not exist. Never
       clobbers an existing file (exit 2). Exit 0 on create.
 
+Subcommands:
+  check, verify, init-status (above) plus:
+
+  classify --repo <path> --commit <hash> --base-ref <ref>
+      Read-only. Computes which risk-ladder lane a PR falls into, from GIT
+      DATA ONLY (unforgeable by the PR). Prints {"mode": <token>,
+      "changed": [...]}. Modes:
+        slice              -- no gate/workflow paths touched (normal). Product
+                              code plus its own tests lives HERE, not in
+                              maintenance -- see _is_gate_path.
+        gate-maintenance   -- only the gate surface (gates/** and
+                              tests/test_gate_*), nothing else
+        gate-change-mixed-with-code -- gate paths mixed with other paths (refused)
+        workflow-touch     -- any .github/workflows/** changed (refused, ceremony)
+      Exit 0 iff mode is slice or gate-maintenance, else 1.
+
+  maintain --repo <path> --commit <hash> --base-ref <ref>
+      Maintenance-mode judgement: the OLD (base) gate authorizing the NEW
+      (head) gate. Checks, all fail-closed:
+        head-gate-parses        -- AST-parse of head gates/reality_gate.py
+        version-monotonic       -- head GATE_VERSION >= base GATE_VERSION
+                                  ("version N authorizes only >= N")
+        head-contract-binding   -- the head gates/contract.yml pins at least one
+                                  of expect_definition/expect_substring/test_cmd
+        assertion-classes-monotonic -- the head contract does not DROP a binding
+                                  class the base contract pinned. Repointing an
+                                  assertion is maintenance; deleting one is
+                                  weakening the exam, and "bound" alone cannot
+                                  tell them apart.
+      Prints a JSON result. Exit 0 iff all pass, else 1.
+      The head test suite and the BASE negative matrix are run by the
+      workflow itself (they are pytest invocations), not here.
+
 Exit codes:
   0  passed (check) / verified written (verify) / created (init-status)
   1  check failed (check/verify): a requested check did not pass
   2  usage error, item not found/ambiguous, bad status.json, or existing init path.
      Named reason tokens appear in the stdout JSON: "no-binding-check",
-     "test-timeout", "bad-status-json", "substring-absent", "definition-absent",
+     "test-timeout", "bad-status-json", "substring-absent",
+     "definition-absent",
      "definition-preexisting" (already defined at a merge base -- this change
      did not land it), "definition-bad-base-ref", "definition-shallow-repo"
      (no ancestry to compute a merge base from -- fix the checkout depth),
      "definition-unparseable", "definition-unreadable".
+     Maintenance-mode tokens: "maintenance-unreadable", "maintenance-unparseable",
+     "maintenance-no-version", "maintenance-base-unreadable",
+     "maintenance-blocked:bump", "maintenance-blocked:contract" (head contract
+     pins nothing), "maintenance-blocked:contract-weakened" (head contract drops
+     a class the base pinned; the dropped keys are listed in
+     "dropped_assertion_classes").
 """
 import ast
 import json
@@ -77,6 +117,12 @@ from typing import Dict, List, Optional, Tuple
 
 GIT_TIMEOUT = 30
 DEFAULT_TEST_TIMEOUT = 600
+
+# GATE_VERSION -- the gate judges its own upgrades. The running gate (from the
+# base branch, under pull_request_target) refuses to authorize a head gate whose
+# GATE_VERSION is lower than its own (anti-downgrade, minimal form: "version N
+# authorizes only >= N"). Bump this when the gate's verdict contract changes.
+GATE_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +607,222 @@ def _usage_error(message: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# PR lane classification (maintenance mode): which risk-ladder lane a PR
+# falls into, computed from GIT DATA ONLY so the PR cannot forge it.
+# ---------------------------------------------------------------------------
+
+def _changed_paths(repo: str, base_ref: str, sha: str) -> Tuple[Optional[List[str]], Optional[str]]:
+    """All paths changed relative to EVERY merge base (union), sorted.
+    Consult every base, matching _definition_present's philosophy: picking an
+    arbitrary one lets a criss-cross history undercount. Returns (paths, None)
+    or (None, reason) fail-closed (shallowness named, anything else unreadable)."""
+    if not base_ref.strip() or base_ref.startswith("-"):
+        return None, "classify-bad-base-ref"
+    bases = _merge_bases(repo, base_ref, sha)
+    if not bases:
+        if _is_shallow(repo):
+            return None, "classify-shallow-repo"
+        return None, "classify-unreadable"
+    changed = set()
+    for base in bases:
+        r = _git(repo, "diff", "--name-only", base, sha)
+        if r is None or r.returncode != 0:
+            return None, "classify-unreadable"
+        for ln in r.stdout.splitlines():
+            p = ln.strip()
+            if p:
+                changed.add(p)
+    return sorted(changed), None
+
+
+_GATE_TREE = "gates/"
+_GATE_TEST_PREFIX = "tests/test_gate_"
+_WORKFLOW_TREE = ".github/workflows/"
+
+
+# Files that decide WHAT pytest collects, and therefore what the head suite and
+# the base negative matrix actually assert. A conftest.py with
+# `collect_ignore_glob = ["test_gate_*"]` takes the head suite from 101 tests to
+# 4 and still exits 0; `items[:] = items[:1]` takes the staged base matrix from
+# 78 to 1. These reach the gate's verdict without touching gates/**, so they are
+# gate surface wherever they appear. Cost: a slice PR that also edits
+# pyproject.toml/setup.cfg is refused as mixed and has to split. That is the
+# fail-closed direction, and it is the intended trade.
+# Matched only at the repo ROOT: pytest reads these from the rootdir, so a copy
+# in a subpackage does not steer the run the gate performs. Anchoring here
+# instead of matching the basename anywhere avoids refusing an ordinary
+# "add a dependency" PR in a larger repo as gate-change-mixed-with-code.
+_PYTEST_ROOT_CONFIG = frozenset((
+    "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml",
+))
+
+
+def _is_gate_path(path: str) -> bool:
+    """The gate's own authority surface: the judge (gates/**), the tests that
+    pin the judge's verdicts (tests/test_gate_*), and anything that controls
+    what pytest collects (_PYTEST_CONTROL_FILES).
+
+    Deliberately NOT all of tests/**. A slice PR that lands a symbol and the
+    tests for it -- src/foo.py + tests/test_foo.py, the canonical output of the
+    loop and exactly what merged PR #5 looked like -- is ordinary work, not an
+    attempt to edit the exam. Treating every test as gate surface classified
+    those PRs as gate-change-mixed-with-code and refused them outright, which
+    also inverted the pilot's positive control (PR #7).
+
+    The narrower rule stays fail-closed in the direction that matters: a PR that
+    touches tests/test_gate_* alongside product code is still refused."""
+    if path.startswith(_GATE_TREE) or path.startswith(_GATE_TEST_PREFIX):
+        return True
+    base = path.rsplit("/", 1)[-1]
+    # conftest.py steers collection from ANY directory pytest walks.
+    if base == "conftest.py":
+        return True
+    # tests/**/__init__.py executes at import time inside the gate's own suite.
+    if base == "__init__.py" and path.startswith("tests/"):
+        return True
+    # Root, plus directly under tests/: a tests/pytest.ini takes effect whenever
+    # pytest is handed a tests/-rooted path argument (measured: 78 collected -> 0),
+    # which a test_cmd repoint could introduce without maintain noticing -- only
+    # the PRESENCE of the test_cmd class is checked, not its value.
+    return base in _PYTEST_ROOT_CONFIG and path in (base, "tests/" + base)
+
+
+def _classify_lane(changed: List[str]) -> Tuple[str, List[str], List[str], List[str]]:
+    """Bucket changed paths and decide the lane: workflow-touch (ceremony,
+    always running red before the bypass actor merges), gate-maintenance
+    (gate surface only -- see _is_gate_path), or the two refusal states --
+    gate-change-mixed-with-code and slice (normal)."""
+    workflows = [p for p in changed if p.startswith(_WORKFLOW_TREE)]
+    gated = [p for p in changed
+             if not p.startswith(_WORKFLOW_TREE) and _is_gate_path(p)]
+    other = [p for p in changed if p not in workflows and p not in gated]
+    if workflows:
+        return "workflow-touch", workflows, gated, other
+    if gated and other:
+        return "gate-change-mixed-with-code", workflows, gated, other
+    if gated:
+        return "gate-maintenance", workflows, gated, other
+    return "slice", workflows, gated, other
+
+
+# ---------------------------------------------------------------------------
+# Maintenance judgement: the OLD (base) gate authorizing the NEW (head) gate.
+# ---------------------------------------------------------------------------
+
+CONTRACT_BINDING_KEYS = ("expect_definition", "expect_substring", "test_cmd")
+
+# Every key the workflow's contract step string-validates. Wider than the binding
+# keys on purpose: expect_file is not an assertion class, so an unusable value
+# there has no "dropped class" to surface and can only be caught as a usability
+# problem.
+CONTRACT_VALIDATED_STRING_KEYS = CONTRACT_BINDING_KEYS + ("expect_file",)
+
+
+def _module_level_version(blob: bytes, name: str) -> Tuple[Optional[int], bool]:
+    """Extract the module-level `name = <int>` (or `name: int = <int>`) from a
+    Python blob by AST. Returns (value, parsed_ok). A missing assignment is
+    (None, True) -- the file parsed but never sets the version; an unparseable
+    file is (None, False)."""
+    try:
+        tree = ast.parse(blob.decode("utf-8", errors="replace"))
+    except SyntaxError:
+        return None, False
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name) \
+                and node.targets[0].id == name \
+                and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, int):
+            return node.value.value, True
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
+                and node.target.id == name \
+                and node.value is not None \
+                and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, int):
+            return node.value.value, True
+    return None, True
+
+
+def _assertion_classes(blob: bytes) -> Tuple[Optional[set], Optional[str]]:
+    """Which binding keys the contract pins with a real, non-empty value.
+
+    This MUST agree with the parser that actually builds the gate's assertions
+    (the workflow's pyyaml step), so it uses that same parser rather than a
+    line scan. A scan was tried and was fail-OPEN, not fail-closed: it read the
+    TEXT after the colon, so `expect_definition: ""`, `: null`, a bare `:` with
+    a trailing comment, a copy nested under another key, and a duplicate key
+    whose last occurrence is empty all read as "pinned" while yaml.safe_load
+    yields nothing. That is the T2 exam-tamper spelled with two quote marks
+    instead of by deleting the line -- the gate would then run with no
+    definition assertion at all, which is exactly what pilot/t3-hollow passes.
+
+    Returns (classes, None), or (None, reason) when the contract cannot be
+    parsed authoritatively -- including when PyYAML is absent. Degrading to a
+    weaker reading would be a silent fallback; refusing is the honest move, and
+    the workflow installs pyyaml before the step that calls this."""
+    try:
+        import yaml  # noqa: PLC0415 -- optional at import time, required here
+    except ImportError:
+        return None, "maintenance-no-yaml"
+    try:
+        doc = yaml.safe_load(blob.decode("utf-8", errors="replace"))
+    except yaml.YAMLError:
+        return None, "maintenance-contract-unparseable"
+    if doc is None:
+        return set(), None
+    if not isinstance(doc, dict):
+        return None, "maintenance-contract-unparseable"
+    # MIRROR THE CONSUMER EXACTLY. The workflow builds the gate's assertions with
+    #     dfn = (c.get('expect_definition') or '').strip()
+    # so ONLY a non-empty string is a real pin. An earlier version also counted
+    # int/float, which reopened the same fail-open one respelling later:
+    # `expect_definition: 0` (also 0.0, -0.0, 0x0, !!int 0) read as pinned here
+    # while `(0 or '').strip()` is '' there -- maintain green, merged gate running
+    # with no definition assertion. A truthy non-string makes the consumer raise
+    # AttributeError and the job die, so reading it as unpinned here is also the
+    # fail-closed direction: maintain sees the class dropped and blocks.
+    # tests/test_gate_maintenance.py pins this against the LITERAL expression
+    # extracted from the workflow, so the two cannot drift apart again.
+    # Usability first: would the workflow's contract step accept this document at
+    # all? Every key it validates must be checked here, not just the binding ones
+    # -- otherwise the contract LANDS and then reds every subsequent run. That is
+    # fail-closed but it is a pipeline stall, and the promise of this check is
+    # that an unusable contract cannot land in the first place.
+    for key in CONTRACT_VALIDATED_STRING_KEYS:
+        value = doc.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            # expect_file has no "assertion class" to report as dropped, so a
+            # non-string there can only be caught here. For the binding keys a
+            # non-string reads as unpinned below, which surfaces as the more
+            # specific contract-weakened verdict.
+            if key not in CONTRACT_BINDING_KEYS:
+                return None, "maintenance-contract-bad-type"
+            continue
+        # A newline or NUL can forge extra step outputs through the workflow's
+        # GITHUB_OUTPUT writer, and the workflow refuses them.
+        if any(ch in value for ch in ("\n", "\r", "\0")):
+            return None, "maintenance-contract-unsafe-value"
+
+    # test_timeout is int()-ed by the workflow; anything that raises there stalls
+    # every later run.
+    timeout = doc.get("test_timeout")
+    if timeout is not None:
+        try:
+            int(timeout)
+        except (TypeError, ValueError):
+            return None, "maintenance-contract-bad-type"
+
+    found = set()
+    for key in CONTRACT_BINDING_KEYS:
+        value = doc.get(key)
+        if isinstance(value, str) and value.strip():
+            found.add(key)
+    return found, None
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: check
 # ---------------------------------------------------------------------------
 
@@ -742,6 +1004,167 @@ def cmd_init_status(rest: List[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: classify
+# ---------------------------------------------------------------------------
+
+def cmd_classify(rest: List[str]) -> int:
+    opts = _parse_flags(rest)
+    if opts is None or any(k not in opts for k in ("repo", "commit", "base-ref")):
+        return _usage_error("classify requires --repo, --commit, --base-ref")
+
+    changed, reason = _changed_paths(opts["repo"], opts["base-ref"], opts["commit"])
+    if changed is None:
+        print(json.dumps({
+            "passed": False,
+            "mode": "unreadable",
+            "reason": reason,
+            "changed": [],
+        }))
+        return 1
+
+    mode, workflows, gated, other = _classify_lane(changed)
+    passed = mode in ("slice", "gate-maintenance")
+    print(json.dumps({
+        "passed": passed,
+        "mode": mode,
+        "changed": changed,
+        "workflows": workflows,
+        "gated": gated,
+        "other": other,
+    }))
+    return 0 if passed else 1
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: maintain
+# ---------------------------------------------------------------------------
+
+def cmd_maintain(rest: List[str]) -> int:
+    opts = _parse_flags(rest)
+    if opts is None or any(k not in opts for k in ("repo", "commit", "base-ref")):
+        return _usage_error("maintain requires --repo, --commit, --base-ref")
+
+    repo, sha, base = opts["repo"], opts["commit"], opts["base-ref"]
+
+    # 1. Head gate must parse, and must carry a GATE_VERSION.
+    head_blob = subprocess_git_bytes(repo, "%s:gates/reality_gate.py" % sha)
+    if head_blob is None:
+        print(json.dumps({
+            "passed": False,
+            "reason": "maintenance-unreadable",
+            "checks": {"head-gate-parses": False, "version-monotonic": False,
+                       "head-contract-binding": False,
+                       "assertion-classes-monotonic": False},
+        }))
+        return 1
+    head_version, head_parsed = _module_level_version(head_blob, "GATE_VERSION")
+    if not head_parsed:
+        print(json.dumps({
+            "passed": False,
+            "reason": "maintenance-unparseable",
+            "checks": {"head-gate-parses": False, "version-monotonic": False,
+                       "head-contract-binding": False,
+                       "assertion-classes-monotonic": False},
+        }))
+        return 1
+    if head_version is None:
+        print(json.dumps({
+            "passed": False,
+            "reason": "maintenance-no-version",
+            "checks": {"head-gate-parses": True, "version-monotonic": False,
+                       "head-contract-binding": False,
+                       "assertion-classes-monotonic": False},
+        }))
+        return 1
+
+    # 2. Version monotonicity: the head gate must not be older than the base
+    #    gate it is asking to authorize. (Minimum form: N authorizes only >= N.)
+    base_blob = subprocess_git_bytes(repo, "%s:gates/reality_gate.py" % base)
+    if base_blob is None:
+        print(json.dumps({
+            "passed": False,
+            "reason": "maintenance-base-unreadable",
+            "checks": {"head-gate-parses": True, "version-monotonic": False,
+                       "head-contract-binding": False,
+                       "assertion-classes-monotonic": False},
+        }))
+        return 1
+    base_version, base_parsed = _module_level_version(base_blob, "GATE_VERSION")
+    if not base_parsed or base_version is None:
+        base_version = 0
+
+    monotonic = head_version >= base_version
+
+    # 3. The HEAD contract must still pin a binding check (the base contract's
+    #    bindings are what the base gate enforces; a maintenance PR may not
+    #    empty the head contract the next run would inherit).
+    head_contract = subprocess_git_bytes(repo, "%s:gates/contract.yml" % sha)
+    head_classes, head_reason = (_assertion_classes(head_contract)
+                                 if head_contract else (set(), None))
+    if head_classes is None:
+        print(json.dumps({
+            "passed": False,
+            "reason": head_reason,
+            "checks": {"head-gate-parses": True, "version-monotonic": monotonic,
+                       "head-contract-binding": False,
+                       "assertion-classes-monotonic": False},
+        }))
+        return 1
+    bound = bool(head_classes)
+
+    # 4. Assertion-class monotonicity -- the same idea as version-monotonic,
+    #    applied to the exam instead of the examiner: a maintenance PR may
+    #    REPOINT an assertion but may not DROP a class the base contract pinned.
+    #    Without this, "bound" alone is satisfied by gutting
+    #    `expect_definition: normalize_pilot_payload` down to
+    #    `expect_substring: "def "` -- the standing T2 exam-tamper case, which
+    #    classifies as gate-maintenance and would otherwise go fully green.
+    base_contract = subprocess_git_bytes(repo, "%s:gates/contract.yml" % base)
+    base_classes, base_reason = (_assertion_classes(base_contract)
+                                 if base_contract else (set(), None))
+    if base_classes is None:
+        # The base contract is the standard the head is measured against. If it
+        # cannot be read authoritatively there is no standard, so there is no
+        # authorization to give.
+        print(json.dumps({
+            "passed": False,
+            "reason": "maintenance-base-" + base_reason.split("maintenance-")[-1],
+            "checks": {"head-gate-parses": True, "version-monotonic": monotonic,
+                       "head-contract-binding": bound,
+                       "assertion-classes-monotonic": False},
+        }))
+        return 1
+    dropped = sorted(base_classes - head_classes)
+    classes_monotonic = not dropped
+
+    checks = {
+        "head-gate-parses": head_parsed,
+        "version-monotonic": monotonic,
+        "head-contract-binding": bound,
+        "assertion-classes-monotonic": classes_monotonic,
+    }
+    passed = head_parsed and monotonic and bound and classes_monotonic
+    result = {
+        "passed": passed,
+        "checks": checks,
+        "versions": {"base": base_version, "head": head_version},
+    }
+    if dropped:
+        result["dropped_assertion_classes"] = dropped
+    if not passed:
+        if not monotonic:
+            result["reason"] = "maintenance-blocked:bump"
+        elif not bound:
+            result["reason"] = "maintenance-blocked:contract"
+        elif not classes_monotonic:
+            result["reason"] = "maintenance-blocked:contract-weakened"
+        else:
+            result["reason"] = "maintenance-blocked:contract"
+    print(json.dumps(result))
+    return 0 if passed else 1
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -749,7 +1172,7 @@ def main(argv: List[str]) -> int:
     args = argv[1:]
     if not args:
         print(json.dumps({
-            "error": "usage: reality_gate.py <check|verify|init-status> ...",
+            "error": "usage: reality_gate.py <check|verify|init-status|classify|maintain> ...",
         }))
         return 2
 
@@ -762,6 +1185,10 @@ def main(argv: List[str]) -> int:
         return cmd_verify(rest)
     if subcommand == "init-status":
         return cmd_init_status(rest)
+    if subcommand == "classify":
+        return cmd_classify(rest)
+    if subcommand == "maintain":
+        return cmd_maintain(rest)
 
     print(json.dumps({"error": "unknown subcommand: %s" % subcommand}))
     return 2

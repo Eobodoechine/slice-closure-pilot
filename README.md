@@ -18,6 +18,54 @@ A verdict of `passed: true` means every check that ran passed:
 | `substring-present` | the pinned string occurs somewhere — **including in a comment or docstring** |
 | `test-passes` | `test_cmd` exited 0 |
 
+## Maintenance mode (how the gate itself gets upgraded)
+
+Since the gate inherits privileges from the base branch, anything that changes the gate's
+own verdict surface must be judged by the *old* gate, not by the change. The workflow
+classifies every PR by git data alone (`classify` subcommand) into one of four lanes:
+
+| lane | what changed | verdict |
+|---|---|---|
+| `slice` | nothing under the gate surface or `.github/workflows/**` — **including product code plus its own tests** | normal gate checks |
+| `gate-maintenance` | only the gate surface: `gates/**`, `tests/test_gate_*`, and anything steering pytest collection | judged by the **base** gate's `maintain` check, then the head's own test suite |
+| `gate-change-mixed-with-code` | gate surface mixed with other code | **refused** |
+| `workflow-touch` | any `.github/workflows/**` | **refused** — merged only by the bypass actor, always red in the gate |
+
+The gate surface is deliberately **not** all of `tests/**`. A slice that lands a symbol
+and the tests for it — `src/foo.py` + `tests/test_foo.py`, the canonical output of the
+loop — is ordinary work, not an attempt to edit the exam. The surface is exactly:
+
+- `gates/**` — the judge itself;
+- `tests/test_gate_*` — the tests that pin the judge's verdicts;
+- anything that steers **what pytest collects**, because that decides what the head suite
+  and the base negative matrix actually assert: `conftest.py` at any depth,
+  `tests/**/__init__.py`, and `pytest.ini` / `tox.ini` / `setup.cfg` / `pyproject.toml`
+  **at the repo root or directly under `tests/`**. A copy deeper in a subpackage is *not*
+  surface — pytest reads config from the rootdir, so `src/foo/pyproject.toml` cannot steer
+  the run the gate performs. `tests/pytest.ini` can, once pytest is handed a
+  `tests/`-rooted path argument, which a `test_cmd` repoint could introduce.
+
+A `conftest.py` with `collect_ignore_glob = ["test_gate_*"]` takes this repo's suite from
+129 tests to 4 and still exits 0 — which is why it is gate surface even though it is not a
+test. **Practical consequence:** a PR that edits product code *and* the root
+`pyproject.toml` is refused as `gate-change-mixed-with-code` and has to be split in two.
+
+`maintain` must pass **all** of, fail-closed:
+
+- `head-gate-parses` — the head `gates/reality_gate.py` parses as Python;
+- `version-monotonic` — the head gate's `GATE_VERSION >=` the base gate's (`version N
+  authorizes only >= N`; prevents a silent downgrade);
+- `head-contract-binding` — the head `gates/contract.yml` still pins a binding check, so
+  the next run inherits a gate that is still honest;
+- `assertion-classes-monotonic` — the head contract does not **drop** an assertion class
+  the base contract pinned. Repointing `expect_definition` at a new symbol is maintenance;
+  replacing it with a trivially satisfied `expect_substring` is weakening the exam, and
+  `head-contract-binding` alone cannot tell those apart.
+
+Then the workflow runs the head's full test suite for real (base assertions, head
+implementation — the base's `tests/test_gate_hollow_slice.py` is run against the head
+checkout, so the new gate must pass the old gate's strongest corpus).
+
 ### What `definition-present` requires, exactly
 
 The symbol must be a **module-level** `def`/`async def`/`class` in **production
