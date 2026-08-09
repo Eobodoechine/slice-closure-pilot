@@ -1,6 +1,14 @@
 # Slice Closure Gate contract. Read ONLY from the base branch by CI.
 # Rule: a PR that edits gates/** or .github/workflows/** fails the gate.
-slice_id: "SLICE-PILOT-001"
+#
+# REPOINTED to SLICE-PILOT-002. SLICE-PILOT-001 (validate_pilot_input) is merged,
+# so under a closure gate its contract is satisfied-and-done: every honest PR
+# would now block with definition-preexisting, which is correct but leaves the
+# repo permanently red. Repointed at an UNLANDED symbol rather than parking the
+# contract, because parking would drop expect_definition entirely and the whole
+# point of the next step is to observe the definition check in REAL CI -- a
+# parked contract can only exercise test_cmd.
+slice_id: "SLICE-PILOT-002"
 
 # expect_definition is AST-checked: the name must be a real def/async def/class
 # binding in the committed tree. Use this for "the slice landed the symbol".
@@ -11,7 +19,7 @@ slice_id: "SLICE-PILOT-001"
 # because its own docstring said the file "deliberately does NOT contain
 # `def validate_pilot_input`". Note expect_file would NOT have prevented that --
 # it narrows which text is searched, then still does a raw match.
-expect_definition: "validate_pilot_input"
+expect_definition: "normalize_pilot_payload"
 
 # expect_file: ""            # optional: restrict the HEAD search to one path. The base
 #                            # lookup stays repo-wide on purpose, so a symbol that merely
