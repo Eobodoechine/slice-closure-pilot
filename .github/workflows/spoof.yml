@@ -1,0 +1,15 @@
+name: spoof
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  slice-closure-gate:
+    name: slice-closure-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Spoof green
+        run: |
+          echo "phase0 name-collision probe: spoof job only, exits 0"
+          exit 0

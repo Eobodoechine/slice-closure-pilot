@@ -173,3 +173,9 @@ control separates "correctly refusing" from "broken and refusing everything".
 — comments, docstrings, commit message — must not accidentally satisfy the assertion
 under test. The suite assembles the pinned symbol at runtime so its own source never
 contains the literal string.
+
+## Phase 0 probe marker (name-collision probe, read-only)
+
+This line is the README-only change shipped with the Phase 0 name-collision probe.
+It defines nothing; the honest gate under the base contract reports
+`definition-absent` and goes red as designed.
