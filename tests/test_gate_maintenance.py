@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import re
@@ -445,24 +446,16 @@ def _workflow_consumer_classes(doc):
     here = os.path.dirname(os.path.abspath(__file__))
     wf = os.path.join(os.path.dirname(here), ".github", "workflows",
                       "slice-closure-gate.yml")
-    text = open(wf, encoding="utf-8").read()
+    py = _contract_step_python()
+    scalar = _wf_scalar(py, doc)
     found = set()
-    for key, var in (("expect_substring", "sub"),
-                     ("expect_definition", "dfn"),
-                     ("test_cmd", "cmd")):
-        ms = re.findall(r"^\s*%s = (scalar\(%r\))\s*$" % (var, key), text, re.M)
-        # Uniqueness, not just presence. `assert ms` alone catches a renamed or
-        # reformatted line, but not a SECOND live copy earlier in the file: the
-        # oracle would bind to the stale one and pass vacuously while the real
-        # expression drifted.
-        assert len(ms) == 1, \
-            "expected exactly 1 workflow expression for %s, found %d" % (var, len(ms))
+    for key, var in _contract_scalar_assignments(py).items():
         try:
-            value = eval(ms[0], {"__builtins__": {}}, {"scalar": _wf_scalar(doc)})  # noqa: S307
+            value = scalar(key)
         except _WorkflowRefuses:
             # The workflow refuses the whole contract here, so nothing is pinned.
             return set()
-        if value:
+        if value and var in ("sub", "dfn", "cmd"):
             found.add(key)
     return found
 
@@ -471,26 +464,114 @@ class _WorkflowRefuses(Exception):
     """The workflow's contract step would sys.exit(1) on this document."""
 
 
-def _wf_scalar(doc):
-    """The workflow's own `scalar()` helper, lifted from the YAML so the oracle
-    tracks it. Extracted rather than reimplemented: the previous oracle restated
-    the rule in its own words, got it wrong the same way the code did, and
-    certified the bug."""
+def _workflow_text(name="slice-closure-gate.yml"):
     here = os.path.dirname(os.path.abspath(__file__))
-    wf = os.path.join(os.path.dirname(here), ".github", "workflows",
-                      "slice-closure-gate.yml")
-    body = open(wf, encoding="utf-8").read()
-    m = re.search(r"^(\s*)def scalar\(key\):\n(.*?)(?=\n\1[a-zA-Z]|\n\n)", body,
-                  re.M | re.S)
-    assert m, "workflow's scalar() helper not found -- did the contract step change?"
-    src = textwrap.dedent(m.group(0))
+    path = os.path.join(os.path.dirname(here), ".github", "workflows", name)
+    return open(path, encoding="utf-8").read()
+
+
+def _run_bodies(text):
+    """Every step's `run:` script, via yaml.safe_load rather than by matching
+    indentation. An earlier version anchored on `^run:\\s*\\|`, which missed
+    `- run: |` (the commonest style), folded `run: >`, and single-line
+    `run: echo ...` -- three demonstrated evasions of a guard whose whole job is
+    to be un-evadable. YAML resolves all four forms to the same string, so
+    parsing removes the entire class."""
+    import yaml
+    doc = yaml.safe_load(text) or {}
+    out = []
+    for job_name, job in (doc.get("jobs") or {}).items():
+        for i, step in enumerate((job or {}).get("steps") or []):
+            run = (step or {}).get("run")
+            if isinstance(run, str):
+                out.append((job_name, step.get("name") or "step[%d]" % i, run))
+    return out
+
+
+def _all_run_steps():
+    out = []
+    for name in _workflow_names():
+        out.extend(_run_bodies(_workflow_text(name)))
+    return out
+
+
+def _workflow_names():
+    here = os.path.dirname(os.path.abspath(__file__))
+    wf_dir = os.path.join(os.path.dirname(here), ".github", "workflows")
+    return sorted(n for n in os.listdir(wf_dir) if n.endswith((".yml", ".yaml")))
+
+
+# Interpolations allowed inside a run: body. Everything here is either
+# GitHub-generated (a 40-hex sha) or produced by our own code from a closed set
+# of literals. Anything else -- notably any PR-author-controlled text such as
+# head.ref, .title, .body or github.actor -- is a script-injection vector,
+# because ${{ }} is substituted into the script SOURCE before bash parses it.
+_ALLOWED_RUN_INTERPOLATIONS = frozenset((
+    "github.event.pull_request.head.sha",
+    "github.event.pull_request.base.sha",
+    "steps.lane.outputs.mode",
+    "steps.lane.outputs.rc",
+))
+
+
+def _contract_step_python():
+    """The Python the contract step actually executes, taken from the parsed
+    step body -- not scraped out of the raw YAML with a regex."""
+    bodies = [(name, run) for _, name, run in _all_run_steps()
+              if "contract.yml" in run and "python3 - <<'EOF'" in run]
+    assert len(bodies) == 1, \
+        "expected exactly 1 contract step, found %d" % len(bodies)
+    run = bodies[0][1]
+    m = re.search(r"python3 - <<'EOF'\n(.*?)\nEOF\s*$", run, re.S)
+    assert m, "contract step no longer embeds a python heredoc"
+    return textwrap.dedent(m.group(1))
+
+
+def _contract_scalar_assignments(py):
+    """{contract_key: variable_name} for every module-level `x = scalar('k')`,
+    found by AST. Structural, so a reformatted or duplicated line cannot make
+    this bind to the wrong thing."""
+    tree = ast.parse(py)
+    out = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target, value = node.targets[0], node.value
+        if not isinstance(target, ast.Name) or not isinstance(value, ast.Call):
+            continue
+        if not (isinstance(value.func, ast.Name) and value.func.id == "scalar"):
+            continue
+        assert len(value.args) == 1 and isinstance(value.args[0], ast.Constant), \
+            "unexpected scalar() call shape at line %d" % node.lineno
+        key = value.args[0].value
+        assert key not in out, "contract key %r assigned twice" % key
+        out[key] = target.id
+    for key in ("expect_substring", "expect_definition", "test_cmd"):
+        assert key in out, "workflow no longer reads %s via scalar()" % key
+    return out
+
+
+def _wf_scalar(py, doc):
+    """The workflow's own `scalar()` helper, lifted from the step and executed.
+    Extracted rather than reimplemented: an oracle that restates the rule in its
+    own words gets it wrong the same way the code does, and certifies the bug.
+
+    Located by AST with a UNIQUENESS assertion. `re.search` bound to the first
+    textual match, so a second copy anywhere earlier in the file left the live
+    helper unchecked -- the same presence-not-uniqueness defect that was fixed in
+    the sibling extraction and missed here."""
+    tree = ast.parse(py)
+    defs = [n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "scalar"]
+    assert len(defs) == 1, \
+        "expected exactly 1 scalar() definition in the contract step, found %d" % len(defs)
 
     def sys_exit(_code=0):
         raise _WorkflowRefuses()
 
     ns = {"c": doc, "sys": type("s", (), {"exit": staticmethod(sys_exit)}),
           "print": lambda *a, **k: None, "isinstance": isinstance, "type": type}
-    exec(compile(src, "<workflow>", "exec"), ns)  # noqa: S102
+    exec(compile(ast.Module(body=[defs[0]], type_ignores=[]), "<workflow>", "exec"), ns)  # noqa: S102
     return ns["scalar"]
 
 
@@ -594,29 +675,57 @@ def test_no_contract_output_is_interpolated_into_a_run_body(tmp_path):
 
     and exited 0 with reality_gate.py never invoked: a green required check and
     no gate run at all. Contract values must reach a step through env: only."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    wf_dir = os.path.join(os.path.dirname(here), ".github", "workflows")
-    offenders = []
-    for name in sorted(os.listdir(wf_dir)):
-        if not name.endswith((".yml", ".yaml")):
-            continue
-        text = open(os.path.join(wf_dir, name), encoding="utf-8").read()
-        # Walk run: blocks by indentation and flag any contract interpolation.
-        lines = text.splitlines()
-        in_run, run_indent = False, 0
-        for i, line in enumerate(lines, 1):
-            stripped = line.strip()
-            indent = len(line) - len(line.lstrip())
-            if in_run and stripped and indent <= run_indent:
-                in_run = False
-            if re.match(r"^run:\s*\|", stripped):
-                in_run, run_indent = True, indent
-                continue
-            if in_run and re.search(r"\$\{\{\s*steps\.contract\.outputs\.", line):
-                offenders.append("%s:%d: %s" % (name, i, stripped))
+    offenders = _unsafe_run_interpolations()
     assert not offenders, (
-        "contract values interpolated into shell source (use env: instead):\n  "
-        + "\n  ".join(offenders))
+        "attacker-influenced values interpolated into shell source "
+        "(pass them through env: instead):\n  " + "\n  ".join(offenders))
+
+
+def _unsafe_run_interpolations(names=None):
+    offenders = []
+    for name in (names or _workflow_names()):
+        for job, step, run in _run_bodies(_workflow_text(name)):
+            for expr in re.findall(r"\$\{\{(.*?)\}\}", run, re.S):
+                if expr.strip() not in _ALLOWED_RUN_INTERPOLATIONS:
+                    offenders.append("%s / %s / %s: ${{%s}}"
+                                     % (name, job, step, expr.strip()))
+    return offenders
+
+
+# The four ways a step can carry a script. All resolve to the same YAML string,
+# which is the point: the previous indentation-based walker caught only the last.
+_STEP_FORMS = {
+    "dash-run-literal": "        - run: |\n            echo ${{ steps.contract.outputs.sub }}\n",
+    "folded": "        - name: x\n          run: >\n            echo ${{ steps.contract.outputs.sub }}\n",
+    "single-line": "        - name: x\n          run: echo ${{ steps.contract.outputs.sub }}\n",
+    "run-literal": "        - name: x\n          run: |\n            echo ${{ steps.contract.outputs.sub }}\n",
+}
+
+
+@pytest.mark.parametrize("form", sorted(_STEP_FORMS))
+def test_the_interpolation_walker_catches_every_step_form(tmp_path, form):
+    """Test the guard, not just with the guard. Each of these hides the same
+    injection in a different step shape."""
+    wf = tmp_path / "wf.yml"
+    wf.write_text("name: t\non: push\njobs:\n  j:\n    steps:\n"
+                  + _STEP_FORMS[form], encoding="utf-8")
+    bodies = _run_bodies(wf.read_text())
+    assert len(bodies) == 1, "walker missed the %s step form entirely" % form
+    found = [e.strip() for e in re.findall(r"\$\{\{(.*?)\}\}", bodies[0][2], re.S)]
+    assert found == ["steps.contract.outputs.sub"], \
+        "%s step form hid the interpolation" % form
+
+
+def test_the_walker_rejects_any_unlisted_interpolation(tmp_path):
+    """Not just steps.contract.outputs.*: a PR-author-controlled field such as
+    head.ref is the classic injection vector and must be caught too."""
+    wf = tmp_path / "wf.yml"
+    wf.write_text("name: t\non: push\njobs:\n  j:\n    steps:\n"
+                  "        - run: echo ${{ github.event.pull_request.head.ref }}\n",
+                  encoding="utf-8")
+    bodies = _run_bodies(wf.read_text())
+    exprs = [e.strip() for e in re.findall(r"\$\{\{(.*?)\}\}", bodies[0][2], re.S)]
+    assert exprs and all(e not in _ALLOWED_RUN_INTERPOLATIONS for e in exprs)
 
 
 def test_maintain_refuses_a_contract_value_containing_a_newline(tmp_path):
@@ -633,6 +742,44 @@ def test_maintain_refuses_a_contract_value_containing_a_newline(tmp_path):
                           "--commit", sha, "--base-ref", base)
     assert out["passed"] is False and code == 1
     assert out["reason"] == "maintenance-contract-unsafe-value"
+
+
+@pytest.mark.parametrize("body,reason", [
+    # expect_file is NOT a binding class, so an unusable value there has no
+    # "dropped class" to surface -- without an explicit usability check the
+    # contract LANDS and then reds every subsequent run. Fail-closed, but a
+    # pipeline stall, and it breaks the promise that maintain refusal means such
+    # a contract cannot land at all.
+    ('expect_file: "src/a\\nb.py"\n', "maintenance-contract-unsafe-value"),
+    ('expect_file: 0\n', "maintenance-contract-bad-type"),
+    ('expect_file: [a]\n', "maintenance-contract-bad-type"),
+    # test_timeout is int()-ed by the workflow; anything that raises there
+    # stalls every later run.
+    ('test_timeout: "abc"\n', "maintenance-contract-bad-type"),
+    ('test_timeout: [1]\n', "maintenance-contract-bad-type"),
+])
+def test_maintain_refuses_unusable_non_binding_contract_values(tmp_path, body, reason):
+    repo = _init_repo(tmp_path)
+    _commit(repo, "gates/reality_gate.py", GATE_SOURCE, "gate v1")
+    base = _commit(repo, "gates/contract.yml", CONTRACT_DEFINITION, "base contract")
+    sha = _commit(repo, "gates/contract.yml", CONTRACT_DEFINITION + body, "unusable")
+    code, out = _run_gate("maintain", "--repo", str(repo),
+                          "--commit", sha, "--base-ref", base)
+    assert out["passed"] is False and code == 1
+    assert out["reason"] == reason
+
+
+def test_maintain_accepts_a_normal_expect_file_and_timeout(tmp_path):
+    """The usability checks must not refuse an ordinary contract."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "gates/reality_gate.py", GATE_SOURCE, "gate v1")
+    base = _commit(repo, "gates/contract.yml", CONTRACT_DEFINITION, "base contract")
+    sha = _commit(repo, "gates/contract.yml",
+                  CONTRACT_DEFINITION + 'expect_file: "src/pilot.py"\ntest_timeout: 600\n',
+                  "normal")
+    code, out = _run_gate("maintain", "--repo", str(repo),
+                          "--commit", sha, "--base-ref", base)
+    assert out["passed"] is True and code == 0
 
 
 def test_maintain_refuses_when_the_contract_cannot_be_parsed(tmp_path):

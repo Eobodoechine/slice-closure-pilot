@@ -40,8 +40,10 @@ loop — is ordinary work, not an attempt to edit the exam. The surface is exact
 - anything that steers **what pytest collects**, because that decides what the head suite
   and the base negative matrix actually assert: `conftest.py` at any depth,
   `tests/**/__init__.py`, and `pytest.ini` / `tox.ini` / `setup.cfg` / `pyproject.toml`
-  **at the repo root** (pytest reads those from the rootdir, so a copy in a subpackage
-  does not steer the run).
+  **at the repo root or directly under `tests/`**. A copy deeper in a subpackage is *not*
+  surface — pytest reads config from the rootdir, so `src/foo/pyproject.toml` cannot steer
+  the run the gate performs. `tests/pytest.ini` can, once pytest is handed a
+  `tests/`-rooted path argument, which a `test_cmd` repoint could introduce.
 
 A `conftest.py` with `collect_ignore_glob = ["test_gate_*"]` takes this repo's suite from
 129 tests to 4 and still exits 0 — which is why it is gate surface even though it is not a

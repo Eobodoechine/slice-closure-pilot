@@ -711,6 +711,12 @@ def _classify_lane(changed: List[str]) -> Tuple[str, List[str], List[str], List[
 
 CONTRACT_BINDING_KEYS = ("expect_definition", "expect_substring", "test_cmd")
 
+# Every key the workflow's contract step string-validates. Wider than the binding
+# keys on purpose: expect_file is not an assertion class, so an unusable value
+# there has no "dropped class" to surface and can only be caught as a usability
+# problem.
+CONTRACT_VALIDATED_STRING_KEYS = CONTRACT_BINDING_KEYS + ("expect_file",)
+
 
 def _module_level_version(blob: bytes, name: str) -> Tuple[Optional[int], bool]:
     """Extract the module-level `name = <int>` (or `name: int = <int>`) from a
@@ -777,19 +783,41 @@ def _assertion_classes(blob: bytes) -> Tuple[Optional[set], Optional[str]]:
     # fail-closed direction: maintain sees the class dropped and blocks.
     # tests/test_gate_maintenance.py pins this against the LITERAL expression
     # extracted from the workflow, so the two cannot drift apart again.
+    # Usability first: would the workflow's contract step accept this document at
+    # all? Every key it validates must be checked here, not just the binding ones
+    # -- otherwise the contract LANDS and then reds every subsequent run. That is
+    # fail-closed but it is a pipeline stall, and the promise of this check is
+    # that an unusable contract cannot land in the first place.
+    for key in CONTRACT_VALIDATED_STRING_KEYS:
+        value = doc.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            # expect_file has no "assertion class" to report as dropped, so a
+            # non-string there can only be caught here. For the binding keys a
+            # non-string reads as unpinned below, which surfaces as the more
+            # specific contract-weakened verdict.
+            if key not in CONTRACT_BINDING_KEYS:
+                return None, "maintenance-contract-bad-type"
+            continue
+        # A newline or NUL can forge extra step outputs through the workflow's
+        # GITHUB_OUTPUT writer, and the workflow refuses them.
+        if any(ch in value for ch in ("\n", "\r", "\0")):
+            return None, "maintenance-contract-unsafe-value"
+
+    # test_timeout is int()-ed by the workflow; anything that raises there stalls
+    # every later run.
+    timeout = doc.get("test_timeout")
+    if timeout is not None:
+        try:
+            int(timeout)
+        except (TypeError, ValueError):
+            return None, "maintenance-contract-bad-type"
+
     found = set()
     for key in CONTRACT_BINDING_KEYS:
         value = doc.get(key)
-        if not isinstance(value, str):
-            continue
-        # A newline or NUL in a binding value can forge extra step outputs
-        # through the workflow's GITHUB_OUTPUT writer. The workflow refuses these
-        # too; refusing here as well means a maintenance PR cannot LAND such a
-        # contract in the first place, rather than landing it and breaking every
-        # later run.
-        if any(ch in value for ch in ("\n", "\r", "\0")):
-            return None, "maintenance-contract-unsafe-value"
-        if value.strip():
+        if isinstance(value, str) and value.strip():
             found.add(key)
     return found, None
 
