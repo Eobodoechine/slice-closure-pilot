@@ -2,6 +2,7 @@ import ast
 import json
 import os
 import re
+import shutil
 import subprocess
 import textwrap
 import sys
@@ -508,7 +509,10 @@ def _workflow_names():
 # because ${{ }} is substituted into the script SOURCE before bash parses it.
 _ALLOWED_RUN_INTERPOLATIONS = frozenset((
     "github.event.pull_request.head.sha",
-    "github.event.pull_request.base.sha",
+    # This is emitted by the first workflow step after it fetches the base
+    # branch tip itself.  Unlike the event's base.sha snapshot, it is neither
+    # stale nor PR-controlled.
+    "steps.base.outputs.sha",
     "steps.lane.outputs.mode",
     "steps.lane.outputs.rc",
 ))
@@ -679,6 +683,50 @@ def test_no_contract_output_is_interpolated_into_a_run_body(tmp_path):
     assert not offenders, (
         "attacker-influenced values interpolated into shell source "
         "(pass them through env: instead):\n  " + "\n  ".join(offenders))
+
+
+def test_workflow_resolves_the_live_base_branch_tip_not_event_snapshot():
+    """The event payload's base.sha can predate a gate hardening commit.
+
+    Every judging step must instead consume the SHA fetched from main by the
+    first step; otherwise an old gate implementation can judge a current PR.
+    """
+    text = _workflow_text()
+    assert "github.event.pull_request.base.sha" not in text
+    assert 'id: base' in text
+    assert 'refs/heads/main:refs/remotes/origin/main' in text
+    assert 'BASE="$(git rev-parse refs/remotes/origin/main)"' in text
+    assert 'echo "sha=$BASE" >> "$GITHUB_OUTPUT"' in text
+    assert text.count("steps.base.outputs.sha") == 4
+
+
+def test_lane_step_survives_runner_errexit_and_writes_outputs(tmp_path):
+    """GitHub invokes a run block as `bash -e`; replay that exact shell.
+
+    Ceremony lanes intentionally make classify return 1.  The classifier step
+    must still exit 0 after recording its lane and return code, so the following
+    annotated refusal step — not runner errexit — produces the failure.
+    """
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    head = _commit(repo, ".github/workflows/probe.yml", "name: probe\n", "ceremony")
+    basegate = tmp_path / "basegate.py"
+    shutil.copyfile(GATE, basegate)
+    lane_json = tmp_path / "lane.json"
+    output = tmp_path / "github-output"
+    lane_step = next(run for _, name, run in _all_run_steps()
+                     if name == "Classify PR lane from git data (unforgeable)")
+    lane_step = lane_step.replace("${{ steps.base.outputs.sha }}", base)
+    lane_step = lane_step.replace("${{ github.event.pull_request.head.sha }}", head)
+    lane_step = lane_step.replace("/tmp/basegate/reality_gate.py", str(basegate))
+    lane_step = lane_step.replace("/tmp/lane.json", str(lane_json))
+    result = subprocess.run(["bash", "-e", "-c", lane_step],
+                            capture_output=True, text=True,
+                            env=dict(os.environ, GITHUB_WORKSPACE=str(repo),
+                                     GITHUB_OUTPUT=str(output)))
+    assert result.returncode == 0, result.stderr
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert values == {"mode": "workflow-touch", "rc": "1"}
 
 
 def _unsafe_run_interpolations(names=None):
