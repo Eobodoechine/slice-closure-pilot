@@ -48,9 +48,17 @@ _DEF_SUBSTRING = "def " + _SYMBOL
 PASSING_SUITE = "python3 -m unittest discover -q"
 
 
-def _git(repo, *args):
+def _git(repo, *args, when=None):
+    """`when` pins author+committer date. `git merge-base` tie-breaks between
+    multiple bases by date, so a criss-cross fixture built with wall-clock times
+    picks a different base depending on how fast the suite runs -- which made
+    one test pass alone and fail in a full run."""
+    env = None
+    if when is not None:
+        env = dict(os.environ,
+                   GIT_AUTHOR_DATE=when, GIT_COMMITTER_DATE=when)
     subprocess.run(["git", "-C", str(repo), *args], check=True,
-                   capture_output=True, text=True)
+                   capture_output=True, text=True, env=env)
 
 
 def _init_repo(tmp_path):
@@ -742,23 +750,48 @@ def test_pr_supplied_gitattributes_cannot_hide_the_base(tmp_path):
 def test_symbol_at_any_merge_base_counts_as_preexisting(tmp_path):
     """N2: a criss-cross history has more than one merge base, and
     `git merge-base` without -a returns an arbitrary one. Picking the base that
-    happens not to define the symbol made an already-landed function look new."""
+    happens not to define the symbol made an already-landed function look new.
+
+    Dates are pinned: merge-base tie-breaks by date, so an unpinned fixture
+    picks a different base depending on how fast the suite runs.
+    """
     repo = _init_repo(tmp_path)
     root = _head(repo)
     _git(repo, "checkout", "-q", "-b", "A")
-    a1 = _commit(repo, "src_a.py", REAL_DEFINITIONS["plain"], "A defines it")
+    (repo / "src_a.py").write_text(REAL_DEFINITIONS["plain"])
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "A defines it", when="2001-01-01T00:00:01")
+    a1 = _head(repo)
     _git(repo, "checkout", "-q", "-b", "B", root)
-    b1 = _commit(repo, "b.py", "b = 1\n", "B does not")
+    (repo / "b.py").write_text("b = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "B does not", when="2001-01-01T00:00:02")
+    b1 = _head(repo)
     _git(repo, "checkout", "-q", "A")
-    _git(repo, "merge", "-q", "--no-edit", b1)
+    _git(repo, "merge", "-q", "--no-edit", b1, when="2001-01-01T00:00:03")
     a2 = _head(repo)
     _git(repo, "checkout", "-q", "B")
-    _git(repo, "merge", "-q", "--no-edit", a1)
-    head = _commit(repo, "redeclare.py", REAL_DEFINITIONS["plain"], "re-declare")
+    _git(repo, "merge", "-q", "--no-edit", a1, when="2001-01-01T00:00:04")
+    (repo / "redeclare.py").write_text(REAL_DEFINITIONS["plain"])
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "re-declare", when="2001-01-01T00:00:05")
+    head = _head(repo)
 
     bases = subprocess.run(["git", "-C", str(repo), "merge-base", "-a", a2, head],
                            capture_output=True, text=True).stdout.split()
     assert len(bases) > 1, "fixture must produce a criss-cross"
+
+    # The fixture must DISCRIMINATE: plain `merge-base` has to return a base
+    # that does NOT define the symbol, or consulting only the first base would
+    # block anyway and this test would pin the loop rather than the -a flag.
+    # A mutation pass caught exactly that.
+    plain = subprocess.run(["git", "-C", str(repo), "merge-base", a2, head],
+                           capture_output=True, text=True).stdout.strip()
+    plain_has = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", "%s:src_a.py" % plain],
+        capture_output=True).returncode == 0
+    assert not plain_has, "plain merge-base must return the NON-defining base"
+    assert a1 and b1
 
     code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
                           "--base-ref", a2, "--expect-definition", _SYMBOL)
@@ -922,4 +955,104 @@ def test_unreadable_base_blob_fails_closed(tmp_path):
 
     assert out["checks"]["definition-present"] is False
     assert "definition-unreadable" in out["reasons"]
+    assert code == 1
+
+
+# ---------------------------------------------------------------------------
+# Round-4 verifier findings: two fail-opens on paths the rewrite did not cover.
+# Neither is PR-author-controlled, but both are "could not determine" reading
+# as "newly introduced", which is the failure this check exists to prevent.
+# ---------------------------------------------------------------------------
+
+def test_shallow_clone_without_base_ref_cannot_verify(tmp_path):
+    """The shallow guard existed only on the --base-ref path. Without that flag,
+    `<sha>^` fails to resolve on a shallow clone, bases becomes empty, and the
+    empty-bases path -- which exists so a ROOT commit can pass -- returned True.
+    Proven through `verify`, the subcommand that owns the write."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "src/a.py", REAL_DEFINITIONS["plain"], "symbol lands here")
+    _commit(repo, "later.py", "later = 1\n", "unrelated commit on top")
+
+    shallow = tmp_path / "shallow"
+    subprocess.run(["git", "clone", "-q", "--depth=1", "file://%s" % repo,
+                    str(shallow)], capture_output=True)
+    status = tmp_path / "status.json"
+    status.write_text(json.dumps({
+        "product": "p", "done_sentence": "d", "updated": None,
+        "items": [{"id": "S", "title": "t", "status": "open", "verified": False}],
+    }))
+
+    code, out = _run_gate("verify", "--status-json", str(status), "--item", "S",
+                          "--repo", str(shallow), "--commit", "HEAD",
+                          "--expect-definition", _SYMBOL)
+
+    assert "definition-shallow-repo" in out["reasons"]
+    assert out["passed"] is False and code == 1
+    assert json.loads(status.read_text())["items"][0]["verified"] is False
+
+
+def test_genuine_root_commit_still_passes_without_base_ref(tmp_path):
+    """The control for the fix above: a real root commit HAS nothing before it,
+    and must not be swept up by the unresolvable-parent guard."""
+    repo = tmp_path / "root"
+    repo.mkdir()
+    _git(repo, "init", "-q", ".")
+    _git(repo, "config", "user.email", "t@t.t")
+    _git(repo, "config", "user.name", "T")
+    (repo / "only.py").write_text(REAL_DEFINITIONS["plain"])
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "root commit")
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", "HEAD",
+                          "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is True
+    assert out["passed"] is True and code == 0
+
+
+@pytest.mark.parametrize("odd", ['we\\ird', 'we"ird', 'we\tird'])
+def test_c_quoted_paths_are_not_dropped_from_the_scan(odd, tmp_path):
+    """`core.quotePath=false` suppresses quoting of NON-ASCII bytes only. Git
+    still C-quotes a path containing a backslash, double-quote, tab or newline,
+    which then ends in `.py"` and silently leaves the scan -- and a dropped BASE
+    definition reads as "not there". Same class as the non-ASCII drop fixed a
+    round earlier; `-z` covers the half the flag does not."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "src/%s.py" % odd, REAL_DEFINITIONS["plain"], "base defines it")
+    base = _head(repo)
+    quoted = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", base],
+                            capture_output=True, text=True).stdout
+    assert '"' in quoted, "fixture must actually provoke C-quoting"
+
+    head = _commit(repo, "src/copy.py", REAL_DEFINITIONS["plain"], "copy-paste it")
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert "definition-preexisting" in out["reasons"]
+    assert code == 1
+
+
+# Only separators that are VALID Python. `def` + a bare newline is a syntax
+# error, so it fails closed as unparseable -- correct, but it tests the parser,
+# not the needle.
+@pytest.mark.parametrize("sep", ["\t", "  ", "\t \t"])
+def test_weakest_needle_invariant_is_pinned(sep, tmp_path):
+    """The byte pre-filter is `b"def"`/`b"class"` precisely because anything
+    narrower can miss a real definition -- and missing one at the BASE is a
+    fail-open. A mutation pass showed narrowing it to `b"def "` left the suite
+    green while reintroducing exactly that, so the invariant needs its own
+    fixture: whitespace between `def` and the name that is not a single space."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "src/real.py", "def%s%s(value):\n    return value\n" % (sep, _SYMBOL),
+            "base defines it with unusual spacing")
+    base = _head(repo)
+    head = _commit(repo, "src/copy.py", REAL_DEFINITIONS["plain"], "copy-paste it")
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert "definition-preexisting" in out["reasons"]
     assert code == 1

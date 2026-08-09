@@ -198,11 +198,17 @@ def _python_blobs_at(repo: str, ref: str) -> Optional[List[Tuple[str, str]]]:
     look newly introduced. Nothing about the head tree may influence what is
     scanned at the base.
     """
-    r = _git(repo, "-c", "core.quotePath=false", "ls-tree", "-r", ref)
+    # -z, not core.quotePath=false: that flag only suppresses quoting of
+    # NON-ASCII bytes. Git still C-quotes a path containing a newline, tab,
+    # double-quote, or backslash, which then ends in `.py"` and silently drops
+    # out of the scan -- and a dropped base definition reads as "not there".
+    r = _git(repo, "ls-tree", "-r", "-z", ref)
     if r is None or r.returncode != 0:
         return None
     out: List[Tuple[str, str]] = []
-    for line in r.stdout.splitlines():
+    for line in r.stdout.split("\0"):
+        if not line:
+            continue
         meta, _, path = line.partition("\t")
         if not path.endswith(".py"):
             continue
@@ -308,6 +314,15 @@ def _defines_at(repo: str, ref: str, name: str,
     return False, None
 
 
+def _is_root_commit(repo: str, sha: str) -> bool:
+    """True iff `sha` genuinely has no parents. Only meaningful once shallowness
+    has been ruled out -- a grafted tip in a shallow clone also reports none."""
+    r = _git(repo, "rev-list", "--parents", "-n", "1", sha)
+    if r is None or r.returncode != 0:
+        return False
+    return len(r.stdout.split()) == 1
+
+
 def _is_shallow(repo: str) -> bool:
     r = _git(repo, "rev-parse", "--is-shallow-repository")
     return r is not None and r.returncode == 0 and r.stdout.strip() == "true"
@@ -362,9 +377,25 @@ def _definition_present(repo: str, sha: str, name: str,
                 return False, "definition-shallow-repo"
             return False, "definition-unreadable"
     else:
-        # No parent (root commit) => nothing existed before it.
         parent = _resolve_commit(repo, "%s^" % sha)
-        bases = [parent] if parent else []
+        if parent is None:
+            # A genuine root commit really has nothing before it. A parent we
+            # cannot SEE is a different thing entirely, and must never read as
+            # "nothing existed before" -- that is the fail-open this check
+            # exists to prevent. Order matters: a shallow clone's grafted tip
+            # looks parentless to rev-list, so test shallowness FIRST.
+            if _is_shallow(repo):
+                return False, "definition-shallow-repo"
+            # Defence in depth. I could not construct a reachable case: a
+            # deleted parent OBJECT still resolves, because `<sha>^` is read
+            # from the child's commit object, and a genuinely parentless commit
+            # is a real root. Kept deliberately -- a mutation pass shows no test
+            # covers it, and that is recorded rather than papered over.
+            if not _is_root_commit(repo, sha):
+                return False, "definition-unreadable"
+            bases = []
+        else:
+            bases = [parent]
 
     head_has, reason = _defines_at(repo, sha, name, expect_file)
     if head_has is None:
