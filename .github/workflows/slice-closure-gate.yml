@@ -1,6 +1,6 @@
 name: slice-closure-gate
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
 permissions:
   contents: read
@@ -31,19 +31,27 @@ jobs:
           git show "$BASE:gates/contract.yml"    > /tmp/basegate/contract.yml
           git show "$BASE:gates/reality_gate.py" > /tmp/basegate/reality_gate.py
 
-      - name: Refuse PRs that touch protected gate paths
+      - name: Classify PR lane from git data (unforgeable)
+        id: lane
         run: |
           set -euo pipefail
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
-          CHANGED="$(git diff --name-only "$BASE" "$HEAD")"
-          echo "$CHANGED"
-          if echo "$CHANGED" | grep -qE '^(gates/|\.github/workflows/)'; then
-            echo "::error::PR modifies protected gate/workflow paths. Gate changes need a separate governor-approved PR."
-            exit 1
-          fi
+          python3 /tmp/basegate/reality_gate.py classify \
+            --repo "$GITHUB_WORKSPACE" --commit "$HEAD" --base-ref "$BASE" \
+            | tee /tmp/lane.json
+          MODE="$(python3 -c "import json; print(json.load(open('/tmp/lane.json'))['mode'])")"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse mixed and workflow-touch PRs (ceremony paths)
+        if: steps.lane.outputs.mode == 'workflow-touch' || steps.lane.outputs.mode == 'gate-change-mixed-with-code'
+        run: |
+          set -euo pipefail
+          echo "::error::PR lane '${{ steps.lane.outputs.mode }}' is not judged by the gate. Workflow changes and gate-code-mixed-with-code PRs are merged only by the bypass actor."
+          exit 1
 
       - name: Refuse contracts without binding assertions (closes the cmd_check gap)
+        if: steps.lane.outputs.mode == 'slice'
         id: contract
         run: |
           set -euo pipefail
@@ -66,7 +74,36 @@ jobs:
               f.write(f"timeout={int(c.get('test_timeout') or 600)}\n")
           EOF
 
+      - name: Maintain-mode gate check (base gate authorizes head gate)
+        if: steps.lane.outputs.mode == 'gate-maintenance'
+        id: maintain
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          python3 /tmp/basegate/reality_gate.py maintain \
+            --repo "$GITHUB_WORKSPACE" --commit "$HEAD" --base-ref "$BASE" \
+            | tee /tmp/maintain.json
+          # exit code of reality_gate propagates via pipefail
+
+      - name: Run the base's negative matrix against the head gate (head implementation, base assertions)
+        if: steps.lane.outputs.mode == 'gate-maintenance'
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.sha }}"
+          pip install --quiet pyyaml pytest
+          # Stage base's test_gate_hollow_slice.py next to the head's gates/ so
+          # _locate_gate resolves the same layout as in the repo.
+          mkdir -p /tmp/oldmatrix/{tests,gates}
+          git show "$BASE:tests/test_gate_hollow_slice.py" > /tmp/oldmatrix/tests/test_gate_hollow_slice.py
+          if git cat-file -e "$BASE:tests/conftest.py" 2>/dev/null; then
+            git show "$BASE:tests/conftest.py" > /tmp/oldmatrix/tests/conftest.py
+          fi
+          cp gates/reality_gate.py /tmp/oldmatrix/gates/reality_gate.py
+          python3 -m pytest -q /tmp/oldmatrix/tests/test_gate_hollow_slice.py
+
       - name: Run reality_gate check at PR head with base-pinned assertions
+        if: steps.lane.outputs.mode == 'slice'
         run: |
           set -euo pipefail
           BASE="${{ github.event.pull_request.base.sha }}"
@@ -83,9 +120,19 @@ jobs:
           python3 /tmp/basegate/reality_gate.py "${ARGS[@]}" | tee /tmp/verdict.json
           # exit code of reality_gate propagates via pipefail
 
+      - name: Run the head's own test suite (maintenance mode)
+        if: steps.lane.outputs.mode == 'gate-maintenance'
+        run: |
+          pip install --quiet pyyaml pytest
+          python3 -m pytest -q
+
       - name: Upload verdict receipt
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: slice-closure-receipt-${{ github.event.pull_request.number }}
-          path: /tmp/verdict.json
+          path: |
+            /tmp/lane.json
+            /tmp/verdict.json
+            /tmp/maintain.json
+          if-no-files-found: ignore

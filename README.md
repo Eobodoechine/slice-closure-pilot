@@ -18,6 +18,32 @@ A verdict of `passed: true` means every check that ran passed:
 | `substring-present` | the pinned string occurs somewhere — **including in a comment or docstring** |
 | `test-passes` | `test_cmd` exited 0 |
 
+## Maintenance mode (how the gate itself gets upgraded)
+
+Since the gate inherits privileges from the base branch, anything that changes the gate's
+own verdict surface (`gates/**`, and the tests that pin it, `tests/**`) must be judged by
+the *old* gate, not the change. The workflow classifies every PR by git data alone
+(`classify` subcommand) into one of four lanes:
+
+| lane | what changed | verdict |
+|---|---|---|
+| `slice` | nothing under `gates/**`, `tests/**`, `.github/workflows/**` | normal gate checks |
+| `gate-maintenance` | only `gates/**` and/or `tests/**`, nothing else | judged by the **base** gate's `maintain` check, then the head's own test suite |
+| `gate-change-mixed-with-code` | gate paths mixed with other code | **refused** (`gate-change-mixed-with-code`) |
+| `workflow-touch` | any `.github/workflows/**` | **refused** — merged only by the bypass actor, always red in the gate |
+
+`maintain` must pass **all** of, fail-closed:
+
+- `head-gate-parses` — the head `gates/reality_gate.py` parses as Python;
+- `version-monotonic` — the head gate's `GATE_VERSION >=` the base gate's (`version N
+  authorizes only >= N`; prevents a silent downgrade);
+- `head-contract-binding` — the head `gates/contract.yml` still pins a binding check, so
+  the next run inherits a gate that is still honest.
+
+Then the workflow runs the head's full test suite for real (base assertions, head
+implementation — the base's `tests/test_gate_hollow_slice.py` is run against the head
+checkout, so the new gate must pass the old gate's strongest corpus).
+
 ### What `definition-present` requires, exactly
 
 The symbol must be a **module-level** `def`/`async def`/`class` in **production
