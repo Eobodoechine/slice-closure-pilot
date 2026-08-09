@@ -106,12 +106,21 @@ def _git(repo: str, *args) -> Optional[subprocess.CompletedProcess]:
     """Run `git -C <repo> <args...>` with a timeout. Returns the CompletedProcess,
     or None on any failure (git missing, timeout, OS error) -- never raises."""
     try:
-        return subprocess.run(
+        proc = subprocess.run(
             ["git", "-C", repo] + list(args),
-            capture_output=True, text=True, timeout=GIT_TIMEOUT,
+            capture_output=True, timeout=GIT_TIMEOUT,
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
+    # Decode permissively: `text=True` uses strict UTF-8, so a single .py path
+    # with non-UTF-8 bytes raised an uncaught UnicodeDecodeError out of every
+    # call site. Blob CONTENT is read by sha, not by path, so a replaced path
+    # character cannot corrupt what gets parsed.
+    return subprocess.CompletedProcess(
+        proc.args, proc.returncode,
+        proc.stdout.decode("utf-8", errors="replace"),
+        proc.stderr.decode("utf-8", errors="replace"),
+    )
 
 
 def _resolve_commit(repo: str, commit: str) -> Optional[str]:
@@ -213,7 +222,13 @@ def _python_blobs_at(repo: str, ref: str) -> Optional[List[Tuple[str, str]]]:
         if not path.endswith(".py"):
             continue
         parts = meta.split()
-        if len(parts) >= 3 and parts[1] == "blob":
+        # Filter on MODE, not object type. A symlink's git type is also "blob",
+        # and its content is the LINK TARGET STRING -- so `ln -s "$(printf
+        # 'def foo(v):\n    return v\n')" foo.py` gives ast a module-level
+        # definition to parse while the checked-out file is dangling and raises
+        # FileNotFoundError on import. One shell command, no privileged access.
+        # Regular files only: 100644 and 100755.
+        if len(parts) >= 3 and parts[0] in ("100644", "100755"):
             out.append((parts[2], path))
     return out
 
@@ -386,11 +401,11 @@ def _definition_present(repo: str, sha: str, name: str,
             # looks parentless to rev-list, so test shallowness FIRST.
             if _is_shallow(repo):
                 return False, "definition-shallow-repo"
-            # Defence in depth. I could not construct a reachable case: a
-            # deleted parent OBJECT still resolves, because `<sha>^` is read
-            # from the child's commit object, and a genuinely parentless commit
-            # is a real root. Kept deliberately -- a mutation pass shows no test
-            # covers it, and that is recorded rather than papered over.
+            # Reachable: a commit whose parent LINE names a missing object
+            # resolves as a commit, is not shallow, and fails rev-list -- so
+            # this is live defence, not dead code. (An earlier comment here
+            # claimed it was unreachable; that was wrong. Deleting the parent
+            # object is not enough, because `<sha>^` is read from the child.)
             if not _is_root_commit(repo, sha):
                 return False, "definition-unreadable"
             bases = []

@@ -1056,3 +1056,128 @@ def test_weakest_needle_invariant_is_pinned(sep, tmp_path):
     assert out["checks"]["definition-present"] is False
     assert "definition-preexisting" in out["reasons"]
     assert code == 1
+
+
+# ---------------------------------------------------------------------------
+# Round-5 verifier finding. A surviving mutant had been pointing at this for two
+# rounds (delete the tree-entry filter, suite stays green) and was written off
+# as harmless both times. Surviving mutants are findings, not noise.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("target", [
+    "def %s(value):\n    return value\n" % _SYMBOL,   # link target IS python
+    "class %s:\n    pass\n" % _SYMBOL,
+])
+def test_symlink_named_py_cannot_satisfy_the_check(target, tmp_path):
+    """`git ls-tree` reports a symlink's TYPE as `blob`; only its MODE (120000)
+    distinguishes it. Its "content" is the link target string -- so
+    `ln -s "$(printf 'def foo(v):\\n    return v\\n')" foo.py` hands ast a
+    module-level definition while the checked-out path is dangling and raises
+    FileNotFoundError on import. One shell command, no privileged access, and it
+    survives the protected-path step. Filter on mode, not type."""
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    (repo / "src").mkdir(parents=True, exist_ok=True)
+    os.symlink(target, repo / "src" / "fake.py")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "land it via a symlink")
+    head = _head(repo)
+
+    entry = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", head],
+                           capture_output=True, text=True).stdout
+    assert "120000 blob" in entry, "fixture must actually produce a symlink entry"
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert out["passed"] is False and code == 1
+
+
+def test_a_real_file_with_the_same_content_still_passes(tmp_path):
+    """Control for the mode filter: tightening it must not block regular files.
+    Executable mode counts too -- 100755 is a normal file."""
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    head = _commit(repo, "src/real.py", REAL_DEFINITIONS["plain"], "a real file")
+    os.chmod(repo / "src" / "real.py", 0o755)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "make it executable")
+    head = _head(repo)
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is True
+    assert out["passed"] is True and code == 0
+
+
+def test_unreadable_ancestry_is_not_nothing_existed_before(tmp_path):
+    """Kills the mutant that flipped `_is_root_commit`'s error return to True,
+    turning "cannot read ancestry" back into "nothing existed before".
+
+    Fabricates a commit whose parent LINE names a missing object: it resolves as
+    a commit, the repo is not shallow, and rev-list fails. The verifier refuted
+    my earlier claim that this branch was unreachable -- it is live defence.
+    """
+    repo = _init_repo(tmp_path)
+    head_real = _commit(repo, "src/a.py", REAL_DEFINITIONS["plain"], "real")
+    tree = subprocess.run(["git", "-C", str(repo), "rev-parse", "%s^{tree}" % head_real],
+                          capture_output=True, text=True).stdout.strip()
+    raw = "tree %s\nparent %s\nauthor T <t@t.t> 0 +0000\ncommitter T <t@t.t> 0 +0000\n\nfabricated\n" % (
+        tree, "1" * 40)
+    fake = subprocess.run(["git", "-C", str(repo), "hash-object", "-t", "commit",
+                           "-w", "--stdin", "--literally"],
+                          input=raw, capture_output=True, text=True).stdout.strip()
+    assert fake, "fixture must create the fabricated commit"
+    assert subprocess.run(["git", "-C", str(repo), "rev-parse", "--is-shallow-repository"],
+                          capture_output=True, text=True).stdout.strip() == "false"
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", fake,
+                          "--expect-definition", _SYMBOL)
+
+    assert out["passed"] is False and code == 1
+    assert "definition-unreadable" in out["reasons"]
+
+
+def test_non_utf8_path_does_not_crash_the_gate(tmp_path):
+    """`text=True` decodes strictly, so one .py path with non-UTF-8 bytes raised
+    an uncaught UnicodeDecodeError out of every call site. Fail-closed, but a
+    traceback is not a verdict.
+
+    Two fixture traps, both of which made an earlier version test nothing while
+    passing: (1) macOS stores a latin-1 e-acute written from Python as valid
+    UTF-8, so the path must be added through the INDEX, not the filesystem;
+    (2) `git add -A` then stages a DELETION of that entry, because it exists in
+    the index but not on disk -- so the non-UTF-8 commit must come LAST.
+    """
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    head_with_symbol = _commit(repo, "src/real.py", REAL_DEFINITIONS["plain"],
+                               "real slice")
+    assert head_with_symbol
+
+    blob = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+                          input=b"y = 1\n", capture_output=True).stdout.decode().strip()
+    rc = subprocess.run(
+        [b"git", b"-C", str(repo).encode(), b"update-index", b"--add",
+         b"--cacheinfo", b"100644," + blob.encode() + b",src/caf\xe9.py"],
+        capture_output=True).returncode
+    assert rc == 0, "fixture must add a raw non-UTF-8 path"
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "non-utf8 path"],
+                   capture_output=True)
+    head = _head(repo)
+
+    # -z, which is what the gate uses: plain ls-tree C-quotes the bytes as
+    # `\351` rather than emitting them raw, so asserting on it would pass while
+    # testing nothing.
+    raw = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "-z", head],
+                         capture_output=True).stdout
+    assert b"\xe9" in raw, "fixture must actually put raw bytes in the tree"
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert isinstance(out, dict) and "checks" in out     # a verdict, not a crash
+    assert out["checks"]["definition-present"] is True
+    assert code == 0
