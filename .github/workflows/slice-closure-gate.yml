@@ -22,7 +22,11 @@ jobs:
         run: |
           set -euo pipefail
           BASE="${{ github.event.pull_request.base.sha }}"
-          git fetch origin "$BASE" --depth=1 || true
+          # NOT --depth=1: that turns the fetch-depth:0 checkout into a shallow
+          # repo, after which `git merge-base` has no ancestry to work with and
+          # the gate blocks EVERY pr with definition-shallow-repo.
+          git fetch --no-tags origin "$BASE" || true
+          git rev-parse --is-shallow-repository
           mkdir -p /tmp/basegate
           git show "$BASE:gates/contract.yml"    > /tmp/basegate/contract.yml
           git show "$BASE:gates/reality_gate.py" > /tmp/basegate/reality_gate.py

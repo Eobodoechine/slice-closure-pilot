@@ -416,16 +416,28 @@ def test_base_ref_spans_the_whole_range_not_just_the_tip(tmp_path):
     assert out["passed"] is True and code == 0
 
 
-def test_without_base_ref_only_the_tip_commit_is_considered(tmp_path):
-    """Documents the consequence of omitting --base-ref, so CI is never tempted
-    to drop it: the same multi-commit PR above is judged on its tip alone."""
+def test_without_base_ref_the_parent_commit_is_the_baseline(tmp_path):
+    """Documents what omitting --base-ref actually does, so CI is never tempted
+    to drop it.
+
+    This replaces a test that asserted a semantic which no longer exists ("the
+    tip commit alone is diffed"). There is no path diffing now, and its
+    assertions -- definition-present False, exit 1 -- were satisfied by the
+    symbol being pre-existing, not by the behaviour it claimed to pin. It would
+    have stayed green whatever happened to that behaviour. Assert the reason
+    token, which is what actually discriminates.
+    """
     repo = _init_repo(tmp_path)
+    # Symbol lands, then a later commit touches something else entirely.
     _commit(repo, "pilot_app.py", REAL_DEFINITIONS["plain"], "the slice lands")
-    tip = _commit(repo, "notes.md", "changelog\n", "docs tweak on top")
+    tip = _commit(repo, "notes.md", "changelog\n", "unrelated commit on top")
 
     code, out = _run_gate("check", "--repo", str(repo), "--commit", tip,
                           "--expect-definition", _SYMBOL)
 
+    # Baseline is tip^, where the symbol already exists -> pre-existing, and the
+    # token proves that is WHY, not merely that it blocked.
+    assert "definition-preexisting" in out["reasons"]
     assert out["checks"]["definition-present"] is False
     assert code == 1
 
@@ -694,4 +706,220 @@ def test_merge_base_not_base_tip(tmp_path):
 
     assert out["checks"]["definition-present"] is False
     assert "definition-preexisting" in out["reasons"]
+    assert code == 1
+
+
+# ---------------------------------------------------------------------------
+# Round-3 verifier findings. The candidate scan is now enumerated from the TREE
+# (ls-tree + cat-file), never `git grep`, so nothing in the working tree can
+# influence what is scanned at the base.
+# ---------------------------------------------------------------------------
+
+def test_pr_supplied_gitattributes_cannot_hide_the_base(tmp_path):
+    """N1, the worst finding of round 3: attacker-controlled and end-to-end.
+
+    `git grep <tree-ish>` reads .gitattributes from the WORKING TREE, which in
+    CI is the PR head. A PR shipping two lines marking the base's definer
+    `binary` made `-I` drop it from the base scan, so an already-landed symbol
+    looked newly introduced -- and it survived the protected-path step, since
+    .gitattributes is not a protected path.
+    """
+    repo = _init_repo(tmp_path)
+    _commit(repo, "src/real.py", REAL_DEFINITIONS["plain"], "symbol already landed")
+    base = _head(repo)
+    (repo / ".gitattributes").write_text("src/real.py binary\n")
+    head = _commit(repo, "src/reclaim.py", REAL_DEFINITIONS["plain"],
+                   "re-declare it, with attributes hiding the base")
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert "definition-preexisting" in out["reasons"]
+    assert code == 1
+
+
+def test_symbol_at_any_merge_base_counts_as_preexisting(tmp_path):
+    """N2: a criss-cross history has more than one merge base, and
+    `git merge-base` without -a returns an arbitrary one. Picking the base that
+    happens not to define the symbol made an already-landed function look new."""
+    repo = _init_repo(tmp_path)
+    root = _head(repo)
+    _git(repo, "checkout", "-q", "-b", "A")
+    a1 = _commit(repo, "src_a.py", REAL_DEFINITIONS["plain"], "A defines it")
+    _git(repo, "checkout", "-q", "-b", "B", root)
+    b1 = _commit(repo, "b.py", "b = 1\n", "B does not")
+    _git(repo, "checkout", "-q", "A")
+    _git(repo, "merge", "-q", "--no-edit", b1)
+    a2 = _head(repo)
+    _git(repo, "checkout", "-q", "B")
+    _git(repo, "merge", "-q", "--no-edit", a1)
+    head = _commit(repo, "redeclare.py", REAL_DEFINITIONS["plain"], "re-declare")
+
+    bases = subprocess.run(["git", "-C", str(repo), "merge-base", "-a", a2, head],
+                           capture_output=True, text=True).stdout.split()
+    assert len(bases) > 1, "fixture must produce a criss-cross"
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", a2, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert "definition-preexisting" in out["reasons"]
+    assert code == 1
+
+
+def test_backslash_joined_definition_at_base_is_seen(tmp_path):
+    """N3: the old regex pre-filter missed `def \\` + newline + name, which the
+    AST accepts. Missing it at the BASE is a fail-open -- an unseen base
+    definition reads as newly introduced."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "src/real.py",
+            "def \\\n %s(value):\n    return value\n" % _SYMBOL,
+            "base defines it, backslash-joined")
+    base = _head(repo)
+    head = _commit(repo, "src/copy.py", REAL_DEFINITIONS["plain"], "copy-paste it")
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert "definition-preexisting" in out["reasons"]
+    assert code == 1
+
+
+def test_shallow_repo_names_its_own_cause(tmp_path):
+    """N4: an availability failure that presents as "every slice is hollow".
+    The workflow's own `git fetch --depth=1` shallowed the checkout, after which
+    merge-base has no ancestry. It must say so rather than report a generic
+    unreadable."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "src/real.py", REAL_DEFINITIONS["plain"], "landed")
+    missing_base = _head(repo)
+    _commit(repo, "later.py", "later = 1\n", "later")
+
+    shallow = tmp_path / "shallow"
+    subprocess.run(["git", "clone", "-q", "--depth=1", "file://%s" % repo,
+                    str(shallow)], capture_output=True, text=True)
+    assert subprocess.run(["git", "-C", str(shallow), "rev-parse",
+                           "--is-shallow-repository"], capture_output=True,
+                          text=True).stdout.strip() == "true"
+
+    code, out = _run_gate("check", "--repo", str(shallow), "--commit", "HEAD",
+                          "--base-ref", missing_base,
+                          "--expect-definition", _SYMBOL)
+
+    assert "definition-shallow-repo" in out["reasons"]
+    assert out["passed"] is False and code == 1
+
+
+def test_expect_file_does_not_scope_the_base_lookup(tmp_path):
+    """Surviving mutant 3. The existing expect_file test had the symbol at base
+    INSIDE the pinned path, so scoping the base by expect_file was invisible to
+    it. Discriminating case: base defines it elsewhere, head copies it into the
+    pinned path."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "src/old_home.py", REAL_DEFINITIONS["plain"], "base defines it elsewhere")
+    base = _head(repo)
+    head = _commit(repo, "pilot_app.py", REAL_DEFINITIONS["plain"], "copy into pinned path")
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL,
+                          "--expect-file", "pilot_app.py")
+
+    assert out["checks"]["definition-present"] is False
+    assert "definition-preexisting" in out["reasons"]
+    assert code == 1
+
+
+def test_unreadable_base_tree_fails_closed(tmp_path):
+    """Surviving mutant 5. A failed tree read returning [] reads as "no
+    definitions anywhere" -- and at the BASE that means "therefore new".
+
+    An earlier version of this test passed a 40-zero base ref, which fails at
+    merge-base and never reaches the tree read at all, so it pinned nothing.
+    This corrupts the base commit's TREE object: merge-base still resolves
+    (it only needs commit objects) while ls-tree genuinely fails.
+    """
+    repo = _init_repo(tmp_path)
+    _commit(repo, "src/real.py", REAL_DEFINITIONS["plain"], "base defines it")
+    base = _head(repo)
+    head = _commit(repo, "src/copy.py", REAL_DEFINITIONS["plain"], "copy it")
+
+    tree = subprocess.run(["git", "-C", str(repo), "rev-parse", "%s^{tree}" % base],
+                          capture_output=True, text=True).stdout.strip()
+    obj = repo / ".git" / "objects" / tree[:2] / tree[2:]
+    if not obj.exists():                       # packed rather than loose
+        pytest.skip("base tree object is packed; cannot corrupt it in place")
+    obj.unlink()
+
+    assert subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", base],
+                          capture_output=True).returncode != 0
+    assert subprocess.run(["git", "-C", str(repo), "merge-base", "-a", base, head],
+                          capture_output=True).returncode == 0
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert "definition-unreadable" in out["reasons"]
+    assert code == 1
+
+
+def test_tests_directory_branch_is_pinned_independently(tmp_path):
+    """Surviving mutant 12. Every prior fixture under tests/ was ALSO named
+    test_*.py, so it satisfied both branches of the exclusion and either half
+    could be deleted with the suite green. This file is excluded by its
+    DIRECTORY alone."""
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    head = _commit(repo, "tests/helpers.py", REAL_DEFINITIONS["plain"],
+                   "define it in a test helper")
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert code == 1
+
+
+@pytest.mark.parametrize("path", ["mypkg/docs/api.py", "src/examples/gallery.py",
+                                  "src/testing/factories.py"])
+def test_nested_docs_and_examples_are_production_code(path, tmp_path):
+    """N5: excluding any path segment named docs/examples/tests moved the E4
+    false negative rather than removing it. Only TOP-LEVEL directories are
+    excluded -- a shipped `mypkg/docs/api.py` is real code."""
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    head = _commit(repo, path, REAL_DEFINITIONS["plain"], "shipped subpackage")
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is True, path
+    assert out["passed"] is True and code == 0
+
+
+def test_unreadable_base_blob_fails_closed(tmp_path):
+    """Found by my own mutation pass, same class as the verifier's mutant 5 and
+    in the same function: a blob listed by ls-tree but unreadable was SKIPPED.
+    At the base that silently drops a definition, and a dropped base definition
+    reads as "newly introduced"."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "src/real.py", REAL_DEFINITIONS["plain"], "base defines it")
+    base = _head(repo)
+    head = _commit(repo, "src/copy.py", REAL_DEFINITIONS["plain"], "copy it")
+
+    blob = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "%s:src/real.py" % base],
+        capture_output=True, text=True).stdout.strip()
+    obj = repo / ".git" / "objects" / blob[:2] / blob[2:]
+    if not obj.exists():
+        pytest.skip("base blob is packed; cannot corrupt it in place")
+    obj.unlink()
+
+    code, out = _run_gate("check", "--repo", str(repo), "--commit", head,
+                          "--base-ref", base, "--expect-definition", _SYMBOL)
+
+    assert out["checks"]["definition-present"] is False
+    assert "definition-unreadable" in out["reasons"]
     assert code == 1

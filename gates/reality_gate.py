@@ -62,9 +62,10 @@ Exit codes:
   2  usage error, item not found/ambiguous, bad status.json, or existing init path.
      Named reason tokens appear in the stdout JSON: "no-binding-check",
      "test-timeout", "bad-status-json", "substring-absent", "definition-absent",
-     "definition-preexisting" (already defined at the merge base -- this change
-     did not land it), "definition-bad-base-ref", "definition-unparseable",
-     "definition-unreadable".
+     "definition-preexisting" (already defined at a merge base -- this change
+     did not land it), "definition-bad-base-ref", "definition-shallow-repo"
+     (no ancestry to compute a merge base from -- fix the checkout depth),
+     "definition-unparseable", "definition-unreadable".
 """
 import ast
 import json
@@ -176,7 +177,10 @@ def _is_non_production_path(path: str) -> bool:
     all real layouts).
     """
     parts = path.split("/")
-    if any(p in ("tests", "__tests__", "docs", "examples") for p in parts[:-1]):
+    # TOP-LEVEL only. Matching any segment made shipped subpackages -- a real
+    # `mypkg/docs/api.py`, `src/examples/gallery.py` -- invisible to the check,
+    # which is a false negative, not safety.
+    if len(parts) > 1 and parts[0] in ("tests", "__tests__", "docs", "examples"):
         return True
     base = parts[-1]
     if base == "conftest.py":
@@ -184,19 +188,69 @@ def _is_non_production_path(path: str) -> bool:
     return base.startswith("test_") or base.endswith("_test.py")
 
 
-def _module_level_defs(repo: str, ref: str, path: str) -> Optional[set]:
-    """The names bound at MODULE level by a def/async def/class in `path` at `ref`,
-    minus any that a module-level `del` unbinds. None if the blob is unreadable or
-    does not parse as Python.
+def _python_blobs_at(repo: str, ref: str) -> Optional[List[Tuple[str, str]]]:
+    """(blob_sha, path) for every .py file in the tree at `ref`. None on failure.
 
-    Deliberately `tree.body`, not `ast.walk`: walking counts a definition anywhere
-    in the file, including positions that never bind an importable module
-    attribute -- inside `if False:`, under `if TYPE_CHECKING:`, nested in another
-    function, or as a method on a class.
+    Enumerated from the TREE, never with `git grep`. `git grep <tree-ish>` reads
+    .gitattributes from the WORKING TREE, which in CI is the PR head -- so a PR
+    could ship two lines of .gitattributes marking the base's files `binary`,
+    have `-I` drop them from the base scan, and make an already-landed symbol
+    look newly introduced. Nothing about the head tree may influence what is
+    scanned at the base.
     """
-    blob = subprocess_git_bytes(repo, "%s:%s" % (ref, path))
-    if blob is None:
+    r = _git(repo, "-c", "core.quotePath=false", "ls-tree", "-r", ref)
+    if r is None or r.returncode != 0:
         return None
+    out: List[Tuple[str, str]] = []
+    for line in r.stdout.splitlines():
+        meta, _, path = line.partition("\t")
+        if not path.endswith(".py"):
+            continue
+        parts = meta.split()
+        if len(parts) >= 3 and parts[1] == "blob":
+            out.append((parts[2], path))
+    return out
+
+
+def _read_blobs(repo: str, shas: List[str]) -> Optional[Dict[str, bytes]]:
+    """Read many blobs in ONE `git cat-file --batch`, keyed by sha. None on
+    failure. Batching keeps the whole-tree scan to two git calls per ref."""
+    if not shas:
+        return {}
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "cat-file", "--batch"],
+            input="\n".join(shas).encode() + b"\n",
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=GIT_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    data = proc.stdout
+    blobs: Dict[str, bytes] = {}
+    pos = 0
+    while pos < len(data):
+        nl = data.find(b"\n", pos)
+        if nl == -1:
+            break
+        header = data[pos:nl].split()
+        pos = nl + 1
+        if len(header) != 3:
+            return None          # "<sha> missing" or malformed -> fail closed
+        try:
+            size = int(header[2])
+        except ValueError:
+            return None
+        blobs[header[0].decode()] = data[pos:pos + size]
+        pos += size + 1          # trailing newline
+    return blobs
+
+
+def _module_level_defs_from_source(blob: bytes) -> Optional[set]:
+    """Module-level def/async def/class names bound by `blob`, minus any a
+    module-level `del` unbinds. None if it does not parse as Python."""
     try:
         tree = ast.parse(blob.decode("utf-8", errors="replace"))
     except (SyntaxError, ValueError):
@@ -212,39 +266,40 @@ def _module_level_defs(repo: str, ref: str, path: str) -> Optional[set]:
     return names
 
 
-def _candidate_paths(repo: str, ref: str, name: str) -> Optional[List[str]]:
-    """.py paths at `ref` that could plausibly define `name`. A cheap regex
-    pre-filter so the whole tree need not be parsed -- the AST still decides.
-    Over-inclusive by design (it matches nested and dead-code defs too).
-    None on git failure; [] legitimately means no candidates."""
-    # POSIX ERE: `\b` is NOT supported by git grep -E -- it matches nothing and
-    # exits 1, which is indistinguishable from "no candidates" and would make
-    # every definition invisible. Spell the word boundary out.
-    pattern = (r"^[[:space:]]*(async[[:space:]]+)?(def|class)[[:space:]]+"
-               r"%s([^A-Za-z0-9_]|$)" % name)
-    r = _git(repo, "-c", "core.quotePath=false", "grep", "-l", "-I", "-E",
-             pattern, ref, "--", "*.py")
-    if r is None or r.returncode not in (0, 1):
-        return None
-    prefix = "%s:" % ref
-    return [ln[len(prefix):] for ln in r.stdout.splitlines()
-            if ln.startswith(prefix)]
-
-
 def _defines_at(repo: str, ref: str, name: str,
                 expect_file: Optional[str]) -> Tuple[Optional[bool], Optional[str]]:
     """Whether `name` is a module-level definition in production code at `ref`.
     (None, reason) when it cannot be determined -- callers must fail closed on it,
     since "I could not read it" is not "it was not there"."""
-    paths = _candidate_paths(repo, ref, name)
-    if paths is None:
+    entries = _python_blobs_at(repo, ref)
+    if entries is None:
         return None, "definition-unreadable"
     if expect_file is not None:
-        paths = [p for p in paths if p == expect_file]
+        entries = [(sha, p) for sha, p in entries if p == expect_file]
     else:
-        paths = [p for p in paths if not _is_non_production_path(p)]
-    for path in paths:
-        defs = _module_level_defs(repo, ref, path)
+        entries = [(sha, p) for sha, p in entries
+                   if not _is_non_production_path(p)]
+
+    blobs = _read_blobs(repo, [sha for sha, _ in entries])
+    if blobs is None:
+        return None, "definition-unreadable"
+
+    # Pre-filter on BYTES already read from the tree, so nothing outside the
+    # tree can affect it. Deliberately the weakest possible filter that cannot
+    # produce a false negative: a module-level def/class binding REQUIRES the
+    # literal token `def` or `class` in the source, whatever the whitespace,
+    # line endings, or backslash continuations around the name. Anything
+    # narrower re-creates the pre-filter-vs-AST divergence that let a
+    # backslash-joined definition at the base go unseen -- a fail-OPEN, since
+    # an unseen base definition reads as "newly introduced".
+    needles = (b"def", b"class")
+    for sha, path in entries:
+        blob = blobs.get(sha)
+        if blob is None:
+            return None, "definition-unreadable"
+        if not any(n in blob for n in needles):
+            continue
+        defs = _module_level_defs_from_source(blob)
         if defs is None:
             # Present but unparseable. Cannot prove presence OR absence here.
             return None, "definition-unparseable"
@@ -253,11 +308,19 @@ def _defines_at(repo: str, ref: str, name: str,
     return False, None
 
 
-def _merge_base(repo: str, base_ref: str, sha: str) -> Optional[str]:
-    r = _git(repo, "merge-base", base_ref, sha)
+def _is_shallow(repo: str) -> bool:
+    r = _git(repo, "rev-parse", "--is-shallow-repository")
+    return r is not None and r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def _merge_bases(repo: str, base_ref: str, sha: str) -> List[str]:
+    """ALL merge bases. A criss-cross history has more than one, and
+    `git merge-base` without -a returns an arbitrary one -- pick the base that
+    happens not to define the symbol and an already-landed function looks new."""
+    r = _git(repo, "merge-base", "-a", base_ref, sha)
     if r is None or r.returncode != 0:
-        return None
-    return r.stdout.strip() or None
+        return []
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
 def _definition_present(repo: str, sha: str, name: str,
@@ -289,28 +352,37 @@ def _definition_present(repo: str, sha: str, name: str,
     if base_ref is not None:
         if not base_ref.strip() or base_ref.startswith("-"):
             return False, "definition-bad-base-ref"
-        base = _merge_base(repo, base_ref, sha)
-        if base is None:
+        bases = _merge_bases(repo, base_ref, sha)
+        if not bases:
+            # A shallow clone has no ancestry to compute a merge base from, so
+            # EVERY PR would block. Name it, rather than reporting a generic
+            # unreadable -- the symptom is "the gate says every slice is
+            # hollow", and the cause is the checkout, not the code.
+            if _is_shallow(repo):
+                return False, "definition-shallow-repo"
             return False, "definition-unreadable"
     else:
         # No parent (root commit) => nothing existed before it.
-        base = _resolve_commit(repo, "%s^" % sha)
+        parent = _resolve_commit(repo, "%s^" % sha)
+        bases = [parent] if parent else []
 
     head_has, reason = _defines_at(repo, sha, name, expect_file)
     if head_has is None:
         return False, reason
     if not head_has:
         return False, "definition-absent"
-    if base is None:
+    if not bases:
         return True, None
 
     # Base side is deliberately NOT scoped by expect_file: a symbol that merely
-    # moved into the pinned path was not landed by this change.
-    base_has, reason = _defines_at(repo, base, name, None)
-    if base_has is None:
-        return False, reason
-    if base_has:
-        return False, "definition-preexisting"
+    # moved into the pinned path was not landed by this change. Pre-existing at
+    # ANY merge base counts.
+    for base in bases:
+        base_has, reason = _defines_at(repo, base, name, None)
+        if base_has is None:
+            return False, reason
+        if base_has:
+            return False, "definition-preexisting"
     return True, None
 
 

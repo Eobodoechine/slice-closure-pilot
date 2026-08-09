@@ -110,9 +110,19 @@ a version string, a config value. Never for "this symbol exists".
 - `expect_file` scopes the **head** search to one path. It deliberately does *not*
   scope the base lookup: a symbol that merely moved into the pinned path was not landed
   by this change.
-- Candidate files are found with a `git grep` pre-filter and confirmed with `ast`, so
-  the whole tree is never parsed. The pre-filter is over-inclusive by design — it also
-  matches nested and dead-code definitions, and the AST is what decides.
+- Candidate files are enumerated **from the tree** (`ls-tree` + one batched `cat-file`),
+  never with `git grep`. `git grep <tree-ish>` reads `.gitattributes` from the *working
+  tree* — which in CI is the PR head — so a PR could ship two lines marking the base's
+  files `binary` and make an already-landed symbol look new. The byte pre-filter is the
+  weakest one that cannot produce a false negative (`def` or `class` appearing at all);
+  anything narrower re-creates a pre-filter/AST divergence, and at the base that is a
+  fail-open.
+- All merge bases are consulted (`merge-base -a`). A criss-cross history has more than
+  one, and picking the arbitrary one lets an already-landed symbol look new.
+- A shallow clone reports `definition-shallow-repo` rather than a generic unreadable —
+  the symptom is "the gate says every slice is hollow" and the cause is checkout depth.
+  The workflow's base fetch deliberately does **not** use `--depth=1`, which would
+  shallow-ify a `fetch-depth: 0` checkout and block every PR.
 - The guarantee is still bounded: the gate is invoked by the party it constrains, so it
   defends against hallucinated completion, not a determined forger.
 
@@ -145,6 +155,12 @@ Every one of those tests was mutation-checked — and mutation testing repeatedl
 its place. It caught that the stale-branch test passed whether or not the merge base
 was used, so it never actually pinned that fix; `test_merge_base_not_base_tip` exists
 because of that, and constructs the one shape that discriminates.
+
+A third pass then defeated *that* revision: a PR-supplied `.gitattributes` hid the base
+from the scan, multiple merge bases let an arbitrary one be chosen, a backslash-joined
+definition slipped the regex pre-filter, and the workflow's own `--depth=1` fetch could
+block every PR. The scan is now tree-enumerated, which removes that class rather than
+patching it.
 
 `test_a_plain_new_definition_is_found` is the most important test here despite being
 the most boring. The candidate pre-filter is a `git grep -E` regex, and **POSIX ERE
