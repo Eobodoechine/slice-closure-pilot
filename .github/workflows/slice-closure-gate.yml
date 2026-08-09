@@ -17,6 +17,16 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          # This job runs PR-head-controlled code (pytest, and the contract's
+          # test_cmd) in this workspace, under pull_request_target, on a PUBLIC
+          # repo. persist-credentials defaults to TRUE, which writes the
+          # GITHUB_TOKEN into .git/config right where that code can read it.
+          # The token is contents:read and the repo has no secrets, so the blast
+          # radius is small -- but there is no reason to hand it over at all.
+          # Note for the N-repo template: on a PRIVATE repo the anonymous
+          # `git fetch` below would then fail, and the gate blocks (fail-closed,
+          # but you would need to pass the token to that one step explicitly).
+          persist-credentials: false
 
       - name: Load contract and gate FROM BASE BRANCH ONLY (fail-closed if absent)
         run: |
@@ -34,20 +44,30 @@ jobs:
       - name: Classify PR lane from git data (unforgeable)
         id: lane
         run: |
-          set -euo pipefail
+          # Deliberately NOT `set -e`. classify exits 1 for the ceremony lanes,
+          # so under errexit this step died before `mode=` was ever written --
+          # steps.lane.outputs.mode stayed empty, the annotated refusal step
+          # below could never match, and every ceremony PR surfaced as an opaque
+          # step failure with no explanation. Capture the verdict, then refuse.
+          set -uo pipefail
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
           python3 /tmp/basegate/reality_gate.py classify \
             --repo "$GITHUB_WORKSPACE" --commit "$HEAD" --base-ref "$BASE" \
-            | tee /tmp/lane.json
-          MODE="$(python3 -c "import json; print(json.load(open('/tmp/lane.json'))['mode'])")"
+            > /tmp/lane.json
+          RC=$?
+          cat /tmp/lane.json || true
+          MODE="$(python3 -c "import json; print(json.load(open('/tmp/lane.json'))['mode'])" 2>/dev/null)" || MODE=""
+          # Fail closed: no readable verdict is a refusal, never a pass.
+          [ -n "$MODE" ] || MODE="unreadable"
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
 
-      - name: Refuse mixed and workflow-touch PRs (ceremony paths)
-        if: steps.lane.outputs.mode == 'workflow-touch' || steps.lane.outputs.mode == 'gate-change-mixed-with-code'
+      - name: Refuse ceremony, mixed and unreadable lanes
+        if: steps.lane.outputs.rc != '0' || (steps.lane.outputs.mode != 'slice' && steps.lane.outputs.mode != 'gate-maintenance')
         run: |
           set -euo pipefail
-          echo "::error::PR lane '${{ steps.lane.outputs.mode }}' is not judged by the gate. Workflow changes and gate-code-mixed-with-code PRs are merged only by the bypass actor."
+          echo "::error::PR lane '${{ steps.lane.outputs.mode }}' (classify rc=${{ steps.lane.outputs.rc }}) is not judged by the gate. Workflow changes and gate-code-mixed-with-code PRs are merged only by the bypass actor; an unreadable lane is always a refusal."
           exit 1
 
       - name: Refuse contracts without binding assertions (closes the cmd_check gap)

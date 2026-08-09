@@ -21,16 +21,20 @@ A verdict of `passed: true` means every check that ran passed:
 ## Maintenance mode (how the gate itself gets upgraded)
 
 Since the gate inherits privileges from the base branch, anything that changes the gate's
-own verdict surface (`gates/**`, and the tests that pin it, `tests/**`) must be judged by
-the *old* gate, not the change. The workflow classifies every PR by git data alone
-(`classify` subcommand) into one of four lanes:
+own verdict surface must be judged by the *old* gate, not by the change. The workflow
+classifies every PR by git data alone (`classify` subcommand) into one of four lanes:
 
 | lane | what changed | verdict |
 |---|---|---|
-| `slice` | nothing under `gates/**`, `tests/**`, `.github/workflows/**` | normal gate checks |
-| `gate-maintenance` | only `gates/**` and/or `tests/**`, nothing else | judged by the **base** gate's `maintain` check, then the head's own test suite |
-| `gate-change-mixed-with-code` | gate paths mixed with other code | **refused** (`gate-change-mixed-with-code`) |
+| `slice` | nothing under the gate surface or `.github/workflows/**` — **including product code plus its own tests** | normal gate checks |
+| `gate-maintenance` | only the gate surface: `gates/**` and `tests/test_gate_*` | judged by the **base** gate's `maintain` check, then the head's own test suite |
+| `gate-change-mixed-with-code` | gate surface mixed with other code | **refused** |
 | `workflow-touch` | any `.github/workflows/**` | **refused** — merged only by the bypass actor, always red in the gate |
+
+The gate surface is deliberately **not** all of `tests/**`. A slice that lands a symbol
+and the tests for it — `src/foo.py` + `tests/test_foo.py`, the canonical output of the
+loop — is ordinary work, not an attempt to edit the exam. Only `tests/test_gate_*`, which
+pins the judge's own verdicts, counts as gate surface.
 
 `maintain` must pass **all** of, fail-closed:
 
@@ -38,7 +42,11 @@ the *old* gate, not the change. The workflow classifies every PR by git data alo
 - `version-monotonic` — the head gate's `GATE_VERSION >=` the base gate's (`version N
   authorizes only >= N`; prevents a silent downgrade);
 - `head-contract-binding` — the head `gates/contract.yml` still pins a binding check, so
-  the next run inherits a gate that is still honest.
+  the next run inherits a gate that is still honest;
+- `assertion-classes-monotonic` — the head contract does not **drop** an assertion class
+  the base contract pinned. Repointing `expect_definition` at a new symbol is maintenance;
+  replacing it with a trivially satisfied `expect_substring` is weakening the exam, and
+  `head-contract-binding` alone cannot tell those apart.
 
 Then the workflow runs the head's full test suite for real (base assertions, head
 implementation — the base's `tests/test_gate_hollow_slice.py` is run against the head

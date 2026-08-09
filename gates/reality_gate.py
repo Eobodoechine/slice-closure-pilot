@@ -63,8 +63,11 @@ Subcommands:
       Read-only. Computes which risk-ladder lane a PR falls into, from GIT
       DATA ONLY (unforgeable by the PR). Prints {"mode": <token>,
       "changed": [...]}. Modes:
-        slice              -- no gate/workflow paths touched (normal)
-        gate-maintenance   -- only gates/** and/or tests/**, nothing else
+        slice              -- no gate/workflow paths touched (normal). Product
+                              code plus its own tests lives HERE, not in
+                              maintenance -- see _is_gate_path.
+        gate-maintenance   -- only the gate surface (gates/** and
+                              tests/test_gate_*), nothing else
         gate-change-mixed-with-code -- gate paths mixed with other paths (refused)
         workflow-touch     -- any .github/workflows/** changed (refused, ceremony)
       Exit 0 iff mode is slice or gate-maintenance, else 1.
@@ -77,6 +80,11 @@ Subcommands:
                                   ("version N authorizes only >= N")
         head-contract-binding   -- the head gates/contract.yml pins at least one
                                   of expect_definition/expect_substring/test_cmd
+        assertion-classes-monotonic -- the head contract does not DROP a binding
+                                  class the base contract pinned. Repointing an
+                                  assertion is maintenance; deleting one is
+                                  weakening the exam, and "bound" alone cannot
+                                  tell them apart.
       Prints a JSON result. Exit 0 iff all pass, else 1.
       The head test suite and the BASE negative matrix are run by the
       workflow itself (they are pytest invocations), not here.
@@ -92,6 +100,12 @@ Exit codes:
      did not land it), "definition-bad-base-ref", "definition-shallow-repo"
      (no ancestry to compute a merge base from -- fix the checkout depth),
      "definition-unparseable", "definition-unreadable".
+     Maintenance-mode tokens: "maintenance-unreadable", "maintenance-unparseable",
+     "maintenance-no-version", "maintenance-base-unreadable",
+     "maintenance-blocked:bump", "maintenance-blocked:contract" (head contract
+     pins nothing), "maintenance-blocked:contract-weakened" (head contract drops
+     a class the base pinned; the dropped keys are listed in
+     "dropped_assertion_classes").
 """
 import ast
 import json
@@ -621,18 +635,35 @@ def _changed_paths(repo: str, base_ref: str, sha: str) -> Tuple[Optional[List[st
     return sorted(changed), None
 
 
-_GATE_TREES = ("gates/", "tests/")
+_GATE_TREE = "gates/"
+_GATE_TEST_PREFIX = "tests/test_gate_"
 _WORKFLOW_TREE = ".github/workflows/"
+
+
+def _is_gate_path(path: str) -> bool:
+    """The gate's own authority surface: the judge (gates/**) and the tests that
+    pin the judge's verdicts (tests/test_gate_*).
+
+    Deliberately NOT all of tests/**. A slice PR that lands a symbol and the
+    tests for it -- src/foo.py + tests/test_foo.py, the canonical output of the
+    loop and exactly what merged PR #5 looked like -- is ordinary work, not an
+    attempt to edit the exam. Treating every test as gate surface classified
+    those PRs as gate-change-mixed-with-code and refused them outright, which
+    also inverted the pilot's positive control (PR #7).
+
+    The narrower rule stays fail-closed in the direction that matters: a PR that
+    touches tests/test_gate_* alongside product code is still refused."""
+    return path.startswith(_GATE_TREE) or path.startswith(_GATE_TEST_PREFIX)
 
 
 def _classify_lane(changed: List[str]) -> Tuple[str, List[str], List[str], List[str]]:
     """Bucket changed paths and decide the lane: workflow-touch (ceremony,
     always running red before the bypass actor merges), gate-maintenance
-    (gates/** and/or tests/** and nothing else), or the two refusal states --
+    (gate surface only -- see _is_gate_path), or the two refusal states --
     gate-change-mixed-with-code and slice (normal)."""
     workflows = [p for p in changed if p.startswith(_WORKFLOW_TREE)]
     gated = [p for p in changed
-             if p.startswith(_GATE_TREES[0]) or p.startswith(_GATE_TREES[1])]
+             if not p.startswith(_WORKFLOW_TREE) and _is_gate_path(p)]
     other = [p for p in changed if p not in workflows and p not in gated]
     if workflows:
         return "workflow-touch", workflows, gated, other
@@ -675,12 +706,12 @@ def _module_level_version(blob: bytes, name: str) -> Tuple[Optional[int], bool]:
     return None, True
 
 
-def _contract_is_bound(blob: bytes) -> bool:
-    """The contract text pins a non-empty value for at least one of
-    expect_definition / expect_substring / test_cmd. Deliberately a plain
-    line scan (stdlib-only here; the workflow's pyyaml step does the full
-    parse) - but it is fail-closed: a weird YAML shape I cannot confidently
-    read reads as unbound, never as bound."""
+def _assertion_classes(blob: bytes) -> set:
+    """Which binding keys the contract text pins with a non-empty value.
+    Deliberately a plain line scan (stdlib-only here; the workflow's pyyaml step
+    does the full parse) - but it is fail-closed: a weird YAML shape I cannot
+    confidently read reads as pinning nothing, never as pinning something."""
+    found = set()
     text = blob.decode("utf-8", errors="replace")
     for line in text.splitlines():
         stripped = line.strip()
@@ -688,8 +719,14 @@ def _contract_is_bound(blob: bytes) -> bool:
             continue
         for key in CONTRACT_BINDING_KEYS:
             if stripped.startswith(key + ":") and stripped[len(key) + 1:].strip():
-                return True
-    return False
+                found.add(key)
+    return found
+
+
+def _contract_is_bound(blob: bytes) -> bool:
+    """The contract pins at least one of expect_definition / expect_substring /
+    test_cmd."""
+    return bool(_assertion_classes(blob))
 
 
 # ---------------------------------------------------------------------------
@@ -923,7 +960,8 @@ def cmd_maintain(rest: List[str]) -> int:
             "passed": False,
             "reason": "maintenance-unreadable",
             "checks": {"head-gate-parses": False, "version-monotonic": False,
-                       "head-contract-binding": False},
+                       "head-contract-binding": False,
+                       "assertion-classes-monotonic": False},
         }))
         return 1
     head_version, head_parsed = _module_level_version(head_blob, "GATE_VERSION")
@@ -932,7 +970,8 @@ def cmd_maintain(rest: List[str]) -> int:
             "passed": False,
             "reason": "maintenance-unparseable",
             "checks": {"head-gate-parses": False, "version-monotonic": False,
-                       "head-contract-binding": False},
+                       "head-contract-binding": False,
+                       "assertion-classes-monotonic": False},
         }))
         return 1
     if head_version is None:
@@ -940,7 +979,8 @@ def cmd_maintain(rest: List[str]) -> int:
             "passed": False,
             "reason": "maintenance-no-version",
             "checks": {"head-gate-parses": True, "version-monotonic": False,
-                       "head-contract-binding": False},
+                       "head-contract-binding": False,
+                       "assertion-classes-monotonic": False},
         }))
         return 1
 
@@ -952,7 +992,8 @@ def cmd_maintain(rest: List[str]) -> int:
             "passed": False,
             "reason": "maintenance-base-unreadable",
             "checks": {"head-gate-parses": True, "version-monotonic": False,
-                       "head-contract-binding": False},
+                       "head-contract-binding": False,
+                       "assertion-classes-monotonic": False},
         }))
         return 1
     base_version, base_parsed = _module_level_version(base_blob, "GATE_VERSION")
@@ -965,22 +1006,44 @@ def cmd_maintain(rest: List[str]) -> int:
     #    bindings are what the base gate enforces; a maintenance PR may not
     #    empty the head contract the next run would inherit).
     head_contract = subprocess_git_bytes(repo, "%s:gates/contract.yml" % sha)
-    bound = head_contract is not None and _contract_is_bound(head_contract)
+    head_classes = _assertion_classes(head_contract) if head_contract else set()
+    bound = bool(head_classes)
+
+    # 4. Assertion-class monotonicity -- the same idea as version-monotonic,
+    #    applied to the exam instead of the examiner: a maintenance PR may
+    #    REPOINT an assertion but may not DROP a class the base contract pinned.
+    #    Without this, "bound" alone is satisfied by gutting
+    #    `expect_definition: normalize_pilot_payload` down to
+    #    `expect_substring: "def "` -- the standing T2 exam-tamper case, which
+    #    classifies as gate-maintenance and would otherwise go fully green.
+    base_contract = subprocess_git_bytes(repo, "%s:gates/contract.yml" % base)
+    base_classes = _assertion_classes(base_contract) if base_contract else set()
+    dropped = sorted(base_classes - head_classes)
+    classes_monotonic = not dropped
 
     checks = {
         "head-gate-parses": head_parsed,
         "version-monotonic": monotonic,
         "head-contract-binding": bound,
+        "assertion-classes-monotonic": classes_monotonic,
     }
-    passed = head_parsed and monotonic and bound
+    passed = head_parsed and monotonic and bound and classes_monotonic
     result = {
         "passed": passed,
         "checks": checks,
         "versions": {"base": base_version, "head": head_version},
     }
+    if dropped:
+        result["dropped_assertion_classes"] = dropped
     if not passed:
-        result["reason"] = "maintenance-blocked:bump" \
-            if not monotonic else "maintenance-blocked:contract"
+        if not monotonic:
+            result["reason"] = "maintenance-blocked:bump"
+        elif not bound:
+            result["reason"] = "maintenance-blocked:contract"
+        elif not classes_monotonic:
+            result["reason"] = "maintenance-blocked:contract-weakened"
+        else:
+            result["reason"] = "maintenance-blocked:contract"
     print(json.dumps(result))
     return 0 if passed else 1
 
