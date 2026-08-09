@@ -2,6 +2,7 @@ import json
 import os
 import re
 import subprocess
+import textwrap
 import sys
 import pytest
 
@@ -162,6 +163,42 @@ def test_classify_pytest_control_files_are_gate_surface(tmp_path, path):
                           "--commit", sha, "--base-ref", base)
     assert out["mode"] == "gate-maintenance" and code == 0
     assert out["gated"] == [path]
+
+
+@pytest.mark.parametrize("path", [
+    "src/pyproject.toml",
+    "packages/web/setup.cfg",
+    "sub/pytest.ini",
+    "vendor/tox.ini",
+])
+def test_classify_non_root_ini_files_are_NOT_gate_surface(tmp_path, path):
+    """The recall direction. pytest reads these from the rootdir, so a copy in a
+    subpackage does not steer the run the gate performs -- measured: with
+    sub/pyproject.toml, sub/pytest.ini and tests/pytest.ini all present, a
+    root `pytest -q` still collects everything and reports no configfile.
+    Matching the basename at any depth would refuse an ordinary
+    'add a dependency and use it' PR as gate-change-mixed-with-code. Nothing
+    pinned this, so the root anchoring could regress silently."""
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    sha = _commit(repo, path, "# not the rootdir config\n", "nested config")
+    code, out = _run_gate("classify", "--repo", str(repo),
+                          "--commit", sha, "--base-ref", base)
+    assert out["mode"] == "slice" and code == 0
+    assert out["gated"] == []
+
+
+def test_classify_tests_dir_ini_is_gate_surface(tmp_path):
+    """tests/pytest.ini DOES take effect once pytest is handed a tests/-rooted
+    path argument (measured: 78 collected -> 0), which a test_cmd repoint could
+    introduce -- maintain only checks that the test_cmd class is PRESENT, never
+    what it says."""
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    sha = _commit(repo, "tests/pytest.ini", "[pytest]\n", "tests-rooted config")
+    code, out = _run_gate("classify", "--repo", str(repo),
+                          "--commit", sha, "--base-ref", base)
+    assert out["mode"] == "gate-maintenance" and code == 0
 
 
 def test_classify_conftest_mixed_with_code_is_refused(tmp_path):
@@ -413,17 +450,48 @@ def _workflow_consumer_classes(doc):
     for key, var in (("expect_substring", "sub"),
                      ("expect_definition", "dfn"),
                      ("test_cmd", "cmd")):
-        m = re.search(r"^\s*%s = (\(c\.get\(%r\).*\)\.strip\(\))\s*$"
-                      % (var, key), text, re.M)
-        assert m, "no workflow expression found for %s -- did the step change?" % var
+        ms = re.findall(r"^\s*%s = (scalar\(%r\))\s*$" % (var, key), text, re.M)
+        # Uniqueness, not just presence. `assert ms` alone catches a renamed or
+        # reformatted line, but not a SECOND live copy earlier in the file: the
+        # oracle would bind to the stale one and pass vacuously while the real
+        # expression drifted.
+        assert len(ms) == 1, \
+            "expected exactly 1 workflow expression for %s, found %d" % (var, len(ms))
         try:
-            value = eval(m.group(1), {"__builtins__": {}}, {"c": doc})  # noqa: S307
-        except Exception:
-            # The workflow would raise here and the job would die: not a pin.
-            value = ""
+            value = eval(ms[0], {"__builtins__": {}}, {"scalar": _wf_scalar(doc)})  # noqa: S307
+        except _WorkflowRefuses:
+            # The workflow refuses the whole contract here, so nothing is pinned.
+            return set()
         if value:
             found.add(key)
     return found
+
+
+class _WorkflowRefuses(Exception):
+    """The workflow's contract step would sys.exit(1) on this document."""
+
+
+def _wf_scalar(doc):
+    """The workflow's own `scalar()` helper, lifted from the YAML so the oracle
+    tracks it. Extracted rather than reimplemented: the previous oracle restated
+    the rule in its own words, got it wrong the same way the code did, and
+    certified the bug."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    wf = os.path.join(os.path.dirname(here), ".github", "workflows",
+                      "slice-closure-gate.yml")
+    body = open(wf, encoding="utf-8").read()
+    m = re.search(r"^(\s*)def scalar\(key\):\n(.*?)(?=\n\1[a-zA-Z]|\n\n)", body,
+                  re.M | re.S)
+    assert m, "workflow's scalar() helper not found -- did the contract step change?"
+    src = textwrap.dedent(m.group(0))
+
+    def sys_exit(_code=0):
+        raise _WorkflowRefuses()
+
+    ns = {"c": doc, "sys": type("s", (), {"exit": staticmethod(sys_exit)}),
+          "print": lambda *a, **k: None, "isinstance": isinstance, "type": type}
+    exec(compile(src, "<workflow>", "exec"), ns)  # noqa: S102
+    return ns["scalar"]
 
 
 # Falsy non-strings: `_assertion_classes` once counted int/float as pinned, so
@@ -468,6 +536,12 @@ def test_assertion_classes_agrees_with_the_workflow_that_consumes_it(tmp_path):
         'expect_definition: &a "x"\nexpect_substring: *a\n',
         'base: &b {expect_definition: "x"}\nmerged:\n  <<: *b\n',
         'expect_definition: !!str ""\n',
+        # Exotic non-string types. These are where the two CAN legitimately
+        # differ -- see the subset/equality split below.
+        'expect_definition: !!binary aGk=\n',
+        'expect_definition: !!set {a: null}\n',
+        'expect_definition: 2026-08-09\n',
+        'expect_definition: yes\n', 'expect_definition: off\n',
     ])
     for body in bodies:
         classes, reason = gate._assertion_classes(body.encode())
@@ -483,9 +557,82 @@ def test_assertion_classes_agrees_with_the_workflow_that_consumes_it(tmp_path):
             assert classes is None, body
             continue
         expected = _workflow_consumer_classes(doc)
-        assert classes == expected, \
-            "%r -> maintain sees %r, the workflow will use %r" % (body, classes, expected)
+
+        # SAFETY (must hold for every input): maintain may never believe a class
+        # is pinned that the gate will not actually enforce. The reverse -- being
+        # stricter than the consumer -- is safe: maintain sees the class as
+        # dropped and blocks. `!!binary aGk=` is exactly that case (b'hi' is
+        # truthy to the workflow, not a str here), which is why this is a subset
+        # relation and not equality.
+        assert classes <= expected, \
+            "%r -> maintain pins %r the workflow will NOT enforce" % (
+                body, classes - expected)
+
+        # FIDELITY: for the only shapes a real contract uses -- string values --
+        # the two must agree exactly, or maintain is judging a different document.
+        if all(not isinstance(doc.get(k), (bytes, bool, int, float, list, dict))
+               and doc.get(k) is not None or doc.get(k) is None
+               for k in gate.CONTRACT_BINDING_KEYS):
+            assert classes == expected, \
+                "%r -> maintain sees %r, the workflow will use %r" % (
+                    body, classes, expected)
         assert reason is None
+
+
+# ---------------------------------------------------------------------------
+# The contract is DATA, never script. A gate-maintenance PR that ADDS an
+# assertion class reads as strengthening -- classify, maintain, the base
+# negative matrix and the head suite all pass it -- so a contract value is
+# attacker-controlled input to every later run.
+# ---------------------------------------------------------------------------
+
+def test_no_contract_output_is_interpolated_into_a_run_body(tmp_path):
+    """`${{ }}` is substituted into the script's SOURCE TEXT before bash parses
+    it. With `expect_substring: 'x" ] && exit 0 # '` the verdict step rendered as
+
+        [ -n "x" ] && exit 0 # " ] && ARGS+=(--expect-substring "x" ] && exit 0 # ")
+
+    and exited 0 with reality_gate.py never invoked: a green required check and
+    no gate run at all. Contract values must reach a step through env: only."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    wf_dir = os.path.join(os.path.dirname(here), ".github", "workflows")
+    offenders = []
+    for name in sorted(os.listdir(wf_dir)):
+        if not name.endswith((".yml", ".yaml")):
+            continue
+        text = open(os.path.join(wf_dir, name), encoding="utf-8").read()
+        # Walk run: blocks by indentation and flag any contract interpolation.
+        lines = text.splitlines()
+        in_run, run_indent = False, 0
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip())
+            if in_run and stripped and indent <= run_indent:
+                in_run = False
+            if re.match(r"^run:\s*\|", stripped):
+                in_run, run_indent = True, indent
+                continue
+            if in_run and re.search(r"\$\{\{\s*steps\.contract\.outputs\.", line):
+                offenders.append("%s:%d: %s" % (name, i, stripped))
+    assert not offenders, (
+        "contract values interpolated into shell source (use env: instead):\n  "
+        + "\n  ".join(offenders))
+
+
+def test_maintain_refuses_a_contract_value_containing_a_newline(tmp_path):
+    """A newline forges extra step outputs through the GITHUB_OUTPUT writer.
+    Refusing here means such a contract cannot LAND, not merely that one run
+    breaks."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "gates/reality_gate.py", GATE_SOURCE, "gate v1")
+    base = _commit(repo, "gates/contract.yml", CONTRACT_DEFINITION, "base contract")
+    sha = _commit(repo, "gates/contract.yml",
+                  'expect_definition: "normalize_pilot_payload"\n'
+                  'expect_substring: "a\\ndfn=forged"\n', "newline injection")
+    code, out = _run_gate("maintain", "--repo", str(repo),
+                          "--commit", sha, "--base-ref", base)
+    assert out["passed"] is False and code == 1
+    assert out["reason"] == "maintenance-contract-unsafe-value"
 
 
 def test_maintain_refuses_when_the_contract_cannot_be_parsed(tmp_path):

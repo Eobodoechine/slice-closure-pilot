@@ -77,20 +77,52 @@ jobs:
           set -euo pipefail
           pip install --quiet pyyaml pytest
           python3 - <<'EOF'
-          import yaml, sys, os
+          import yaml, sys, os, uuid
           c = yaml.safe_load(open('/tmp/basegate/contract.yml'))
-          sub = (c.get('expect_substring') or '').strip()
-          dfn = (c.get('expect_definition') or '').strip()
-          cmd = (c.get('test_cmd') or '').strip()
+          if not isinstance(c, dict):
+              print("::error::contract.yml is not a mapping — refusing")
+              sys.exit(1)
+
+          def scalar(key):
+              """A binding value must be a STRING. Any other type is refused rather
+              than coerced: `(v or '').strip()` silently turned 0 into '' (an
+              assertion that looks pinned and enforces nothing) and blew up with
+              AttributeError on anything truthy and non-str. gates/reality_gate.py's
+              _assertion_classes pins the same rule, and the suite asserts the two
+              agree."""
+              v = c.get(key)
+              if v is None:
+                  return ''
+              if not isinstance(v, str):
+                  print(f"::error::{key} must be a string, got {type(v).__name__} — refusing")
+                  sys.exit(1)
+              return v.strip()
+
+          sub = scalar('expect_substring')
+          dfn = scalar('expect_definition')
+          cmd = scalar('test_cmd')
+          fil = scalar('expect_file')
           if not sub and not dfn and not cmd:
               print("::error::contract.yml pins none of expect_definition / expect_substring / test_cmd — refusing (no-binding-contract)")
               sys.exit(1)
           if dfn and not dfn.isidentifier():
               print("::error::expect_definition must be a bare identifier (e.g. 'foo', not 'def foo') — refusing")
               sys.exit(1)
+
+          # A newline in a contract value would forge extra step outputs through
+          # the `key=value` writer below. Refuse; the delimiter form is used anyway.
+          for name, value in (('expect_substring', sub), ('expect_definition', dfn),
+                              ('test_cmd', cmd), ('expect_file', fil)):
+              if '\n' in value or '\r' in value or '\0' in value:
+                  print(f"::error::{name} contains a newline or NUL — refusing")
+                  sys.exit(1)
+
+          # Heredoc form with a random delimiter: the `key=value` form cannot
+          # represent a value containing a newline and is forgeable.
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"sub={sub}\n"); f.write(f"dfn={dfn}\n"); f.write(f"cmd={cmd}\n")
-              f.write(f"file={(c.get('expect_file') or '').strip()}\n")
+              for name, value in (('sub', sub), ('dfn', dfn), ('cmd', cmd), ('file', fil)):
+                  d = 'ghadelim_' + uuid.uuid4().hex
+                  f.write(f"{name}<<{d}\n{value}\n{d}\n")
               f.write(f"timeout={int(c.get('test_timeout') or 600)}\n")
           EOF
 
@@ -130,19 +162,37 @@ jobs:
 
       - name: Run reality_gate check at PR head with base-pinned assertions
         if: steps.lane.outputs.mode == 'slice'
+        # Contract values reach this step ONLY through env, never through
+        # ${{ }} interpolation. ${{ }} is substituted into the script's SOURCE
+        # TEXT before bash parses it, so a contract carrying
+        #     expect_substring: 'x" ] && exit 0 # '
+        # rendered as  [ -n "x" ] && exit 0 # " ] && ARGS+=(...)  and the step
+        # exited 0 with reality_gate.py never invoked -- a green required check
+        # and no gate run at all. Reached through the gate-maintenance lane,
+        # because ADDING an assertion class reads as strengthening: classify,
+        # maintain, the base negative matrix and the head suite all pass it.
+        # tests/test_gate_maintenance.py has a static test that no
+        # ${{ steps.contract.outputs.* }} ever appears in a run: body again.
+        env:
+          SUB: ${{ steps.contract.outputs.sub }}
+          DFN: ${{ steps.contract.outputs.dfn }}
+          FILE: ${{ steps.contract.outputs.file }}
+          CMD: ${{ steps.contract.outputs.cmd }}
+          TIMEOUT: ${{ steps.contract.outputs.timeout }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          BASE="${{ github.event.pull_request.base.sha }}"
           # --base-ref makes the definition check evaluate base..head, i.e. what
           # the PR actually proposes. Without it the gate judges the tip commit
           # alone, so a multi-commit PR that lands the symbol early and tips with
           # a docs tweak would be wrongly blocked.
-          ARGS=(check --repo "$GITHUB_WORKSPACE" --commit "${{ github.event.pull_request.head.sha }}" --base-ref "$BASE")
-          [ -n "${{ steps.contract.outputs.sub }}" ] && ARGS+=(--expect-substring "${{ steps.contract.outputs.sub }}")
-          [ -n "${{ steps.contract.outputs.dfn }}" ] && ARGS+=(--expect-definition "${{ steps.contract.outputs.dfn }}")
-          [ -n "${{ steps.contract.outputs.file }}" ] && ARGS+=(--expect-file "${{ steps.contract.outputs.file }}")
-          [ -n "${{ steps.contract.outputs.cmd }}" ] && ARGS+=(--test-cmd "${{ steps.contract.outputs.cmd }}")
-          ARGS+=(--test-timeout "${{ steps.contract.outputs.timeout }}")
+          ARGS=(check --repo "$GITHUB_WORKSPACE" --commit "$HEAD_SHA" --base-ref "$BASE_SHA")
+          [ -n "$SUB" ]  && ARGS+=(--expect-substring "$SUB")
+          [ -n "$DFN" ]  && ARGS+=(--expect-definition "$DFN")
+          [ -n "$FILE" ] && ARGS+=(--expect-file "$FILE")
+          [ -n "$CMD" ]  && ARGS+=(--test-cmd "$CMD")
+          ARGS+=(--test-timeout "$TIMEOUT")
           python3 /tmp/basegate/reality_gate.py "${ARGS[@]}" | tee /tmp/verdict.json
           # exit code of reality_gate propagates via pipefail
 

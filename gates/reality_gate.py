@@ -680,7 +680,11 @@ def _is_gate_path(path: str) -> bool:
     # tests/**/__init__.py executes at import time inside the gate's own suite.
     if base == "__init__.py" and path.startswith("tests/"):
         return True
-    return "/" not in path and base in _PYTEST_ROOT_CONFIG
+    # Root, plus directly under tests/: a tests/pytest.ini takes effect whenever
+    # pytest is handed a tests/-rooted path argument (measured: 78 collected -> 0),
+    # which a test_cmd repoint could introduce without maintain noticing -- only
+    # the PRESENCE of the test_cmd class is checked, not its value.
+    return base in _PYTEST_ROOT_CONFIG and path in (base, "tests/" + base)
 
 
 def _classify_lane(changed: List[str]) -> Tuple[str, List[str], List[str], List[str]]:
@@ -776,7 +780,16 @@ def _assertion_classes(blob: bytes) -> Tuple[Optional[set], Optional[str]]:
     found = set()
     for key in CONTRACT_BINDING_KEYS:
         value = doc.get(key)
-        if isinstance(value, str) and value.strip():
+        if not isinstance(value, str):
+            continue
+        # A newline or NUL in a binding value can forge extra step outputs
+        # through the workflow's GITHUB_OUTPUT writer. The workflow refuses these
+        # too; refusing here as well means a maintenance PR cannot LAND such a
+        # contract in the first place, rather than landing it and breaking every
+        # later run.
+        if any(ch in value for ch in ("\n", "\r", "\0")):
+            return None, "maintenance-contract-unsafe-value"
+        if value.strip():
             found.add(key)
     return found, None
 
