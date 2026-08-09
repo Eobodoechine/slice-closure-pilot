@@ -7,3 +7,7 @@ def test_normalizes():
 
 def test_handles_none():
     assert normalize_pilot_payload(None) == {}
+
+
+def test_normalizes_nested():
+    assert normalize_pilot_payload({"z": 1, "a": {"k": "v"}}) == {"a": {"k": "v"}, "z": 1}
