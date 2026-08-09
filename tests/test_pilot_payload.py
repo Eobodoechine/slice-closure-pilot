@@ -1,5 +1,6 @@
 from pilot_payload import normalize_pilot_payload
 
+# This test module is the honest-control evidence for the live gate receipt.
 
 def test_normalizes():
     assert normalize_pilot_payload({"b": 2, "a": 1}) == {"a": 1, "b": 2}
