@@ -56,6 +56,14 @@ def _run_gate(*args):
     return r.returncode, json.loads(r.stdout)
 
 
+def _load_gate_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("reality_gate_under_test", GATE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 GATE_SOURCE = "GATE_VERSION = 1\n"
 
 CONTRACT_BOUND = "expect_definition: some_name\n"
@@ -128,6 +136,38 @@ def test_classify_code_plus_its_own_tests_is_a_slice(tmp_path):
     assert out["mode"] == "slice" and code == 0
     assert out["changed"] == ["src/pilot_gate.py", "tests/test_pilot_gate.py"]
     assert out["gated"] == []
+
+
+@pytest.mark.parametrize("path", [
+    "conftest.py",
+    "tests/conftest.py",
+    "pytest.ini",
+    "setup.cfg",
+    "pyproject.toml",
+])
+def test_classify_pytest_control_files_are_gate_surface(tmp_path, path):
+    """These decide WHAT pytest collects, so they decide what the head suite and
+    the base negative matrix actually assert -- i.e. they reach the gate's
+    verdict without touching gates/**. Narrowing the gate surface to
+    gates/** + tests/test_gate_* left them classified as ordinary slices, which
+    let a `slice` PR gut every later maintenance run's evidence."""
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    sha = _commit(repo, path, "# pytest control\n", "control file")
+    code, out = _run_gate("classify", "--repo", str(repo),
+                          "--commit", sha, "--base-ref", base)
+    assert out["mode"] == "gate-maintenance" and code == 0
+    assert out["gated"] == [path]
+
+
+def test_classify_conftest_mixed_with_code_is_refused(tmp_path):
+    repo = _init_repo(tmp_path)
+    base = _head(repo)
+    _commit(repo, "tests/conftest.py", "collect_ignore_glob = ['test_gate_*']\n", "conftest")
+    sha = _commit(repo, "pilot_app.py", "def x():\n    pass\n", "code")
+    code, out = _run_gate("classify", "--repo", str(repo),
+                          "--commit", sha, "--base-ref", base)
+    assert out["mode"] == "gate-change-mixed-with-code" and code == 1
 
 
 def test_classify_gate_tests_mixed_with_code_is_still_refused(tmp_path):
@@ -316,3 +356,68 @@ def test_maintain_ignores_commented_out_assertions(tmp_path):
                           "--commit", sha, "--base-ref", base)
     assert out["passed"] is False and code == 1
     assert out["dropped_assertion_classes"] == ["expect_definition"]
+
+
+# Commenting the line out is only ONE member of the evasion class. Each of these
+# keeps text after `expect_definition:` while yaml.safe_load -- the parser that
+# actually builds the gate's assertions -- yields nothing. A line scan read every
+# one of them as "still pinned"; the suite gave that property ZERO coverage
+# (deleting the non-empty-value requirement entirely left the suite green).
+EMPTY_SHAPES = {
+    "empty-string": 'expect_definition: ""\n',
+    "empty-single": "expect_definition: ''\n",
+    "explicit-null": "expect_definition: null\n",
+    "tilde-null": "expect_definition: ~\n",
+    "bare-key": "expect_definition:\n",
+    "trailing-comment-only": "expect_definition:   # dropped in this PR\n",
+    "nested-under-another-key": 'notes:\n  expect_definition: "normalize_pilot_payload"\n',
+    "duplicate-key-last-empty": 'expect_definition: "normalize_pilot_payload"\nexpect_definition: ""\n',
+    "block-scalar-mention": 'notes: |\n  expect_definition: "normalize_pilot_payload"\n',
+}
+
+
+@pytest.mark.parametrize("shape", sorted(EMPTY_SHAPES))
+def test_maintain_refuses_every_spelling_of_an_emptied_assertion(tmp_path, shape):
+    repo = _init_repo(tmp_path)
+    _commit(repo, "gates/reality_gate.py", GATE_SOURCE, "gate v1")
+    base = _commit(repo, "gates/contract.yml", CONTRACT_DEFINITION, "base contract")
+    sha = _commit(repo, "gates/contract.yml",
+                  EMPTY_SHAPES[shape] + 'test_cmd: "python3 -m pytest -q"\n',
+                  "empty it via %s" % shape)
+    code, out = _run_gate("maintain", "--repo", str(repo),
+                          "--commit", sha, "--base-ref", base)
+    assert out["passed"] is False and code == 1, \
+        "%s evaded assertion-class monotonicity" % shape
+    assert out["dropped_assertion_classes"] == ["expect_definition"]
+
+
+def test_assertion_classes_agrees_with_the_parser_that_builds_the_gate(tmp_path):
+    """The invariant behind all of the above: whatever maintain believes the
+    contract pins must equal what yaml.safe_load says it pins. If these two ever
+    disagree, maintain is judging a document the gate will not actually run."""
+    yaml = pytest.importorskip("yaml")
+    gate = _load_gate_module()
+    bodies = list(EMPTY_SHAPES.values()) + [
+        CONTRACT_DEFINITION, CONTRACT_REPOINTED, CONTRACT_TAMPERED,
+        CONTRACT_BOUND, CONTRACT_UNBOUND, "", "not-a-mapping\n",
+        'expect_definition: 0\n', 'expect_definition: false\n',
+        'expect_definition: "  "\n',
+    ]
+    for body in bodies:
+        classes, reason = gate._assertion_classes(body.encode())
+        doc = None
+        try:
+            doc = yaml.safe_load(body)
+        except yaml.YAMLError:
+            assert classes is None, body
+            continue
+        if not isinstance(doc, dict):
+            assert classes is None or classes == set(), body
+            continue
+        expected = {
+            k for k in gate.CONTRACT_BINDING_KEYS
+            if not isinstance(doc.get(k), bool) and doc.get(k) is not None
+            and (str(doc[k]).strip() if not isinstance(doc[k], str) else doc[k].strip())
+        }
+        assert classes == expected, "%r -> %r, parser says %r" % (body, classes, expected)
+        assert reason is None

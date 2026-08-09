@@ -101,6 +101,12 @@ jobs:
           set -euo pipefail
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
+          # maintain reads the contract with the SAME parser that builds the
+          # gate's assertions further down. It refuses (maintenance-no-yaml)
+          # rather than degrading to a weaker reading, so pyyaml is required
+          # here, not optional -- a line scan disagreed with yaml on
+          # `expect_definition: ""` and let the exam-tamper through.
+          pip install --quiet pyyaml
           python3 /tmp/basegate/reality_gate.py maintain \
             --repo "$GITHUB_WORKSPACE" --commit "$HEAD" --base-ref "$BASE" \
             | tee /tmp/maintain.json

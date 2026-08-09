@@ -640,9 +640,23 @@ _GATE_TEST_PREFIX = "tests/test_gate_"
 _WORKFLOW_TREE = ".github/workflows/"
 
 
+# Files that decide WHAT pytest collects, and therefore what the head suite and
+# the base negative matrix actually assert. A conftest.py with
+# `collect_ignore_glob = ["test_gate_*"]` takes the head suite from 101 tests to
+# 4 and still exits 0; `items[:] = items[:1]` takes the staged base matrix from
+# 78 to 1. These reach the gate's verdict without touching gates/**, so they are
+# gate surface wherever they appear. Cost: a slice PR that also edits
+# pyproject.toml/setup.cfg is refused as mixed and has to split. That is the
+# fail-closed direction, and it is the intended trade.
+_PYTEST_CONTROL_FILES = frozenset((
+    "conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml",
+))
+
+
 def _is_gate_path(path: str) -> bool:
-    """The gate's own authority surface: the judge (gates/**) and the tests that
-    pin the judge's verdicts (tests/test_gate_*).
+    """The gate's own authority surface: the judge (gates/**), the tests that
+    pin the judge's verdicts (tests/test_gate_*), and anything that controls
+    what pytest collects (_PYTEST_CONTROL_FILES).
 
     Deliberately NOT all of tests/**. A slice PR that lands a symbol and the
     tests for it -- src/foo.py + tests/test_foo.py, the canonical output of the
@@ -653,7 +667,9 @@ def _is_gate_path(path: str) -> bool:
 
     The narrower rule stays fail-closed in the direction that matters: a PR that
     touches tests/test_gate_* alongside product code is still refused."""
-    return path.startswith(_GATE_TREE) or path.startswith(_GATE_TEST_PREFIX)
+    if path.startswith(_GATE_TREE) or path.startswith(_GATE_TEST_PREFIX):
+        return True
+    return path.rsplit("/", 1)[-1] in _PYTEST_CONTROL_FILES
 
 
 def _classify_lane(changed: List[str]) -> Tuple[str, List[str], List[str], List[str]]:
@@ -706,27 +722,46 @@ def _module_level_version(blob: bytes, name: str) -> Tuple[Optional[int], bool]:
     return None, True
 
 
-def _assertion_classes(blob: bytes) -> set:
-    """Which binding keys the contract text pins with a non-empty value.
-    Deliberately a plain line scan (stdlib-only here; the workflow's pyyaml step
-    does the full parse) - but it is fail-closed: a weird YAML shape I cannot
-    confidently read reads as pinning nothing, never as pinning something."""
+def _assertion_classes(blob: bytes) -> Tuple[Optional[set], Optional[str]]:
+    """Which binding keys the contract pins with a real, non-empty value.
+
+    This MUST agree with the parser that actually builds the gate's assertions
+    (the workflow's pyyaml step), so it uses that same parser rather than a
+    line scan. A scan was tried and was fail-OPEN, not fail-closed: it read the
+    TEXT after the colon, so `expect_definition: ""`, `: null`, a bare `:` with
+    a trailing comment, a copy nested under another key, and a duplicate key
+    whose last occurrence is empty all read as "pinned" while yaml.safe_load
+    yields nothing. That is the T2 exam-tamper spelled with two quote marks
+    instead of by deleting the line -- the gate would then run with no
+    definition assertion at all, which is exactly what pilot/t3-hollow passes.
+
+    Returns (classes, None), or (None, reason) when the contract cannot be
+    parsed authoritatively -- including when PyYAML is absent. Degrading to a
+    weaker reading would be a silent fallback; refusing is the honest move, and
+    the workflow installs pyyaml before the step that calls this."""
+    try:
+        import yaml  # noqa: PLC0415 -- optional at import time, required here
+    except ImportError:
+        return None, "maintenance-no-yaml"
+    try:
+        doc = yaml.safe_load(blob.decode("utf-8", errors="replace"))
+    except yaml.YAMLError:
+        return None, "maintenance-contract-unparseable"
+    if doc is None:
+        return set(), None
+    if not isinstance(doc, dict):
+        return None, "maintenance-contract-unparseable"
     found = set()
-    text = blob.decode("utf-8", errors="replace")
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+    for key in CONTRACT_BINDING_KEYS:
+        value = doc.get(key)
+        if isinstance(value, bool) or value is None:
             continue
-        for key in CONTRACT_BINDING_KEYS:
-            if stripped.startswith(key + ":") and stripped[len(key) + 1:].strip():
+        if isinstance(value, str):
+            if value.strip():
                 found.add(key)
-    return found
-
-
-def _contract_is_bound(blob: bytes) -> bool:
-    """The contract pins at least one of expect_definition / expect_substring /
-    test_cmd."""
-    return bool(_assertion_classes(blob))
+        elif isinstance(value, (int, float)):
+            found.add(key)
+    return found, None
 
 
 # ---------------------------------------------------------------------------
@@ -1006,7 +1041,17 @@ def cmd_maintain(rest: List[str]) -> int:
     #    bindings are what the base gate enforces; a maintenance PR may not
     #    empty the head contract the next run would inherit).
     head_contract = subprocess_git_bytes(repo, "%s:gates/contract.yml" % sha)
-    head_classes = _assertion_classes(head_contract) if head_contract else set()
+    head_classes, head_reason = (_assertion_classes(head_contract)
+                                 if head_contract else (set(), None))
+    if head_classes is None:
+        print(json.dumps({
+            "passed": False,
+            "reason": head_reason,
+            "checks": {"head-gate-parses": True, "version-monotonic": monotonic,
+                       "head-contract-binding": False,
+                       "assertion-classes-monotonic": False},
+        }))
+        return 1
     bound = bool(head_classes)
 
     # 4. Assertion-class monotonicity -- the same idea as version-monotonic,
@@ -1017,7 +1062,20 @@ def cmd_maintain(rest: List[str]) -> int:
     #    `expect_substring: "def "` -- the standing T2 exam-tamper case, which
     #    classifies as gate-maintenance and would otherwise go fully green.
     base_contract = subprocess_git_bytes(repo, "%s:gates/contract.yml" % base)
-    base_classes = _assertion_classes(base_contract) if base_contract else set()
+    base_classes, base_reason = (_assertion_classes(base_contract)
+                                 if base_contract else (set(), None))
+    if base_classes is None:
+        # The base contract is the standard the head is measured against. If it
+        # cannot be read authoritatively there is no standard, so there is no
+        # authorization to give.
+        print(json.dumps({
+            "passed": False,
+            "reason": "maintenance-base-" + base_reason.split("maintenance-")[-1],
+            "checks": {"head-gate-parses": True, "version-monotonic": monotonic,
+                       "head-contract-binding": bound,
+                       "assertion-classes-monotonic": False},
+        }))
+        return 1
     dropped = sorted(base_classes - head_classes)
     classes_monotonic = not dropped
 
