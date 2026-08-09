@@ -48,9 +48,15 @@ jobs:
       - name: Classify the REAL merged history, not fixtures
         run: |
           set -euo pipefail
-          lane() { python3 gates/reality_gate.py classify --repo . \
-                     --commit "$1" --base-ref "$2" \
-                   | python3 -c "import sys,json;print(json.load(sys.stdin)['mode'])"; }
+          # classify EXITS 1 for the ceremony lanes -- that is its contract, not
+          # a failure. Reading the mode has to survive it, or the assertion for
+          # workflow-touch can never run. (This is the same trap that made the
+          # gate's own refusal step unreachable; it caught this file too.)
+          lane() {
+            python3 gates/reality_gate.py classify --repo . \
+              --commit "$1" --base-ref "$2" > /tmp/lane.json || true
+            python3 -c "import json;print(json.load(open('/tmp/lane.json'))['mode'])"
+          }
 
           # de3ddcb = merged PR #5, the canonical loop output: a symbol plus its
           # own tests. Under the all-of-tests/** rule this classified as
