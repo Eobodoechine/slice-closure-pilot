@@ -30,9 +30,10 @@ Binding checks -- `--expect-substring` vs `--expect-definition`:
   test introduced. Keep --expect-substring only for assertions that genuinely are
   about text (a config value, a version string).
 
-  --base-ref sets what "the change under test" means: with it, the range
-  base..commit (what a PR proposes); without it, just that one commit. CI should
-  always pass it -- otherwise a multi-commit PR is judged on its tip alone.
+  --base-ref sets what "the change under test" means: with it, the range from
+  every merge base to commit (what a PR proposes); without it, just that one
+  commit. CI should always pass it -- otherwise a multi-commit PR is judged on
+  its tip alone.
 
 Subcommands:
   check --repo <path> --commit <hash|HEAD>
@@ -188,38 +189,68 @@ def _commit_is_real(repo: str, sha: str) -> bool:
     return bool(r.stdout.strip())
 
 
-def _added_lines(repo: str, sha: str) -> Optional[List[str]]:
-    """Return the content of the patch's ADDED lines (leading '+' stripped, the
-    '+++' file header excluded). None on git failure. Rename-only or binary diffs
-    naturally yield no added content lines."""
-    r = _git(repo, "show", sha)
-    if r is None or r.returncode != 0:
-        return None
+def _parse_added_lines(patch: str) -> List[str]:
+    """Extract added content lines from a unified patch."""
     added = []
-    for line in r.stdout.splitlines():
+    for line in patch.splitlines():
         if line.startswith("+") and not line.startswith("+++"):
             added.append(line[1:])
     return added
 
 
+def _added_lines(repo: str, sha: str,
+                 base: Optional[str] = None) -> Optional[List[str]]:
+    """Return the patch's ADDED lines (leading '+' stripped).
+
+    With no base, inspect the single commit for the legacy/local-call path.
+    With a base, inspect the tree-to-tree PR delta. This matters for an
+    update-branch merge commit: ``git show <merge>`` uses combined-diff
+    semantics and can omit a line that the feature side genuinely introduced,
+    while ``git diff <merge-base> <head>`` describes the proposed change.
+    None means git failed. Rename-only or binary diffs naturally yield no added
+    content lines.
+    """
+    if base is None:
+        r = _git(repo, "show", sha)
+    else:
+        r = _git(repo, "diff", base, sha, "--")
+    if r is None or r.returncode != 0:
+        return None
+    return _parse_added_lines(r.stdout)
+
+
 def _substring_present(repo: str, sha: str, substring: str,
-                       expect_file: Optional[str]) -> bool:
+                       expect_file: Optional[str],
+                       base_ref: Optional[str]) -> bool:
     """Whether `substring` is present per spec semantics.
 
     --expect-file: match against that path's COMMITTED BLOB (git show <sha>:<path>),
     decoding bytes utf-8 with errors="replace".
-    Otherwise: match within a SINGLE added patch line's content (no cross-line span,
-    leading '+' already stripped)."""
+    Otherwise: match within a SINGLE added patch line's content (no cross-line
+    span, leading '+' already stripped). With --base-ref, compare every merge
+    base to head and require the line to be new relative to every base. That is
+    deterministic for criss-cross history and cannot select the convenient base.
+    """
     if expect_file is not None:
         r = subprocess_git_bytes(repo, "%s:%s" % (sha, expect_file))
         if r is None:
             return False
         text = r.decode("utf-8", errors="replace")
         return substring in text
-    added = _added_lines(repo, sha)
-    if not added:
-        return False
-    return any(substring in line for line in added)
+    bases: List[Optional[str]] = [None]
+    if base_ref is not None:
+        if not base_ref.strip() or base_ref.startswith("-"):
+            return False
+        resolved_bases = _merge_bases(repo, base_ref, sha)
+        if not resolved_bases:
+            return False
+        bases = resolved_bases
+
+    for base in bases:
+        added = _added_lines(repo, sha, base)
+        if not added or not any(substring in line for line in added):
+            return False
+    return True
 
 
 def _is_non_production_path(path: str) -> bool:
@@ -541,7 +572,7 @@ def run_checks(repo: str, commit: str, expect_substring: Optional[str],
             substring_check = False
         else:
             substring_check = _substring_present(repo, sha, expect_substring,
-                                                 expect_file)
+                                                 expect_file, base_ref)
         if substring_check is False:
             reasons.append("substring-absent")
 

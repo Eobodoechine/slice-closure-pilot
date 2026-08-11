@@ -99,6 +99,49 @@ def _run_gate(*args):
     return r.returncode, json.loads(r.stdout)
 
 
+def test_update_branch_merge_commit_uses_pr_range_for_substring(tmp_path):
+    """An update-branch merge must retain feature-side text evidence.
+
+    ``git show`` on the merge omits the marker under combined-diff semantics;
+    the merge-base-to-head PR delta contains it. --base-ref must select that
+    latter truth.
+    """
+    repo = _init_repo(tmp_path)
+    base_branch = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--show-current"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    _git(repo, "switch", "-c", "feature")
+    _commit(repo, "feature.txt", "PR_RANGE_MARKER\n", "feature marker")
+
+    _git(repo, "switch", base_branch)
+    base_tip = _commit(repo, "base.txt", "base advanced\n", "advance base")
+
+    _git(repo, "switch", "feature")
+    _git(repo, "merge", "--no-edit", base_branch)
+    merge_head = _head(repo)
+
+    tip_patch = subprocess.run(
+        ["git", "-C", str(repo), "show", "--format=", merge_head],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    range_patch = subprocess.run(
+        ["git", "-C", str(repo), "diff", base_tip, merge_head, "--"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert "+PR_RANGE_MARKER" not in tip_patch
+    assert "+PR_RANGE_MARKER" in range_patch
+
+    rc, out = _run_gate(
+        "check", "--repo", str(repo), "--commit", merge_head,
+        "--base-ref", base_tip,
+        "--expect-substring", "PR_RANGE_MARKER",
+    )
+    assert rc == 0, out
+    assert out["checks"]["substring-present"] is True
+
+
 # ---------------------------------------------------------------------------
 # The hollow slice, in the two shapes that actually occurred
 # ---------------------------------------------------------------------------
