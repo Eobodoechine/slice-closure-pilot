@@ -1,0 +1,1 @@
+Disposable T4 head used to prove that an empty base contract is refused.
