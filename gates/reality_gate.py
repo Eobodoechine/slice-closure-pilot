@@ -653,7 +653,7 @@ _WORKFLOW_TREE = ".github/workflows/"
 # instead of matching the basename anywhere avoids refusing an ordinary
 # "add a dependency" PR in a larger repo as gate-change-mixed-with-code.
 _PYTEST_ROOT_CONFIG = frozenset((
-    "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml",
+    "pytest.ini", "pytest.py", "tox.ini", "setup.cfg", "pyproject.toml",
 ))
 
 
