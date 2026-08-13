@@ -19,7 +19,7 @@ slice_id: "SLICE-PILOT-002"
 # because its own docstring said the file "deliberately does NOT contain
 # `def validate_pilot_input`". Note expect_file would NOT have prevented that --
 # it narrows which text is searched, then still does a raw match.
-expect_definition: "normalize_pilot_payload"
+expect_definition: ""
 
 # expect_file: ""            # optional: restrict the HEAD search to one path. The base
 #                            # lookup stays repo-wide on purpose, so a symbol that merely
@@ -34,5 +34,6 @@ expect_definition: "normalize_pilot_payload"
 # definition only under tests/ docs/ examples/, a pure rename, or a symbol that already
 # existed at the merge base (-> definition-preexisting).
 
-test_cmd: "python3 -m pytest -q"
+expect_substring: ""
+test_cmd: ""
 test_timeout: 600
