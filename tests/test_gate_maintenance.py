@@ -690,14 +690,17 @@ def test_no_contract_output_is_interpolated_into_a_run_body(tmp_path):
 def test_workflow_resolves_the_live_base_branch_tip_not_event_snapshot():
     """The event payload's base.sha can predate a gate hardening commit.
 
-    Every judging step must instead consume the SHA fetched from main by the
-    first step; otherwise an old gate implementation can judge a current PR.
+    Every judging step must instead consume the SHA fetched from the live base
+    ref by the first step; otherwise an old gate implementation can judge a
+    current PR or the disposable T4 base can be silently replaced by main.
     """
     text = _workflow_text()
     assert "github.event.pull_request.base.sha" not in text
     assert 'id: base' in text
-    assert 'refs/heads/main:refs/remotes/origin/main' in text
-    assert 'BASE="$(git rev-parse refs/remotes/origin/main)"' in text
+    assert 'BASE_REF: ${{ github.event.pull_request.base.ref }}' in text
+    assert 'git check-ref-format --branch "$BASE_REF"' in text
+    assert 'refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}' in text
+    assert 'BASE="$(git rev-parse "refs/remotes/origin/${BASE_REF}")"' in text
     assert 'echo "sha=$BASE" >> "$GITHUB_OUTPUT"' in text
     assert text.count("steps.base.outputs.sha") == 4
 

@@ -1,7 +1,10 @@
 name: slice-closure-gate
 on:
   pull_request_target:
-    branches: [main]
+    # main is the real gate. The exact disposable branch below exists only so
+    # the original T4 no-binding acceptance test can exercise a base contract
+    # that deliberately contains no assertions; it is deleted after the run.
+    branches: [main, codex/t4-empty-contract-base-20260813]
 permissions:
   contents: read
 concurrency:
@@ -30,14 +33,17 @@ jobs:
 
       - name: Load contract and gate FROM BASE BRANCH ONLY (fail-closed if absent)
         id: base
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
           # The pull_request_target event's base SHA is a snapshot taken when the
           # event was queued.  It can be stale after main advances, which loads a
           # pre-hardening gate for an otherwise current PR.  Fetch and pin the
           # branch tip once, then pass that immutable SHA to every later step.
-          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
-          BASE="$(git rev-parse refs/remotes/origin/main)"
+          git check-ref-format --branch "$BASE_REF" >/dev/null
+          git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          BASE="$(git rev-parse "refs/remotes/origin/${BASE_REF}")"
           # NOT --depth=1: that turns the fetch-depth:0 checkout into a shallow
           # repo, after which `git merge-base` has no ancestry to work with and
           # the gate blocks EVERY pr with definition-shallow-repo.
