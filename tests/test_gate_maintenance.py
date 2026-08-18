@@ -148,6 +148,7 @@ def test_classify_code_plus_its_own_tests_is_a_slice(tmp_path):
     "src/deep/conftest.py",
     "tests/__init__.py",
     "pytest.ini",
+    "pytest.py",
     "setup.cfg",
     "pyproject.toml",
     "tox.ini",
@@ -171,6 +172,7 @@ def test_classify_pytest_control_files_are_gate_surface(tmp_path, path):
     "src/pyproject.toml",
     "packages/web/setup.cfg",
     "sub/pytest.ini",
+    "src/pytest.py",
     "vendor/tox.ini",
 ])
 def test_classify_non_root_ini_files_are_NOT_gate_surface(tmp_path, path):
